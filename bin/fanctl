@@ -74,15 +74,18 @@ bar() {
 }
 
 cmd_calibrate() {
+    local before peak=0 r i
+    before=$(read_duty)
     echo "Running fan at 100% for 15s..."
     write_duty 255
     sleep 15
-    local peak=0 r i
     for i in 1 2 3; do
         r=$(read_rpm)
         [ "$r" -gt "$peak" ] && peak=$r
         sleep 2
     done
+    # Measuring is not a reason to leave the fans flat out.
+    write_duty "$before"
     echo "$peak" > "$CAL"
     echo "Max speed: $peak RPM  (saved to $CAL)"
 }
@@ -154,10 +157,61 @@ show_disks() {
     [ -n "$line" ] && row "$label" "$line"
 }
 
-# The TrueNAS side: the config, and the last poll fanctld left in $STATE.
-# Only the daemon talks to TrueNAS, so refreshing this costs it nothing.
+# The curve as temperature bands, like `fanctld curve`, marking the band
+# the hottest disk is in.
+show_curve() {  # points "0:35,36:45,...", hysteresis, hottest or ""
+    local pts=(${1//,/ }) i low pct upper band mark
+    echo "CURVE  hysteresis ${2}C"
+    for (( i = 0; i < ${#pts[@]}; i++ )); do
+        low=${pts[i]%%:*}; pct=${pts[i]#*:}; upper=""
+        if [ $(( i + 1 )) -lt ${#pts[@]} ]; then
+            upper=${pts[i+1]%%:*}; band="$low-$(( upper - 1 ))C"
+        else
+            band=">= ${low}C"
+        fi
+        mark=""
+        if [ -n "$3" ] && [ "$3" -ge "$low" ] &&
+           { [ -z "$upper" ] || [ "$3" -lt "$upper" ]; }; then
+            mark="  <- ${3}C"
+        fi
+        printf "  %-11s %-5s [%s]%s\n" "$band" "$pct%" "$(bar "$pct")" "$mark"
+    done
+}
+
+# The last poll fanctld left in $STATE.
+show_reading() {  # poll interval
+    local t out speed want
+    t=$(state_get time)
+    if [ -z "$t" ]; then
+        if systemctl is-active -q fanctld.service 2>/dev/null; then
+            row disks "waiting for the first poll"
+        else
+            row disks "no reading - fanctld is not running"
+        fi
+        return
+    fi
+    row polled "$(state_get at), $(ago $(( $(date +%s) - t ))) (every ${1}s)"
+    out=$(state_get error)
+    if [ -n "$out" ]; then
+        row error "$out"
+        if [ "$(state_get failsafe)" = 1 ]; then
+            row "" "fans at 100% until TrueNAS answers ($(state_get failures) failed polls)"
+        fi
+        return
+    fi
+    show_disks
+    speed=$(state_get speed); want=$(state_get curve)
+    if [ -n "$want" ] && [ "$want" != "$speed" ]; then
+        row hottest "$(state_get hottest)C -> ${want}%, held at ${speed}% by hysteresis"
+    else
+        row hottest "$(state_get hottest)C -> ${speed}%"
+    fi
+}
+
+# The TrueNAS side: the config, and the daemon's last poll. Only the
+# daemon talks to TrueNAS, so refreshing this costs it nothing.
 show_truenas() {
-    local out="" curve="" hyst="" poll t speed want
+    local out="" curve="" hyst="" poll
     echo "TRUENAS"
     if [ ! -e "$CONF" ]; then
         echo "  not set up"
@@ -179,44 +233,17 @@ show_truenas() {
     else
         out="fanctld is not installed"
     fi
-    if [ -n "$curve" ]; then
-        row curve "$(sed 's/\([0-9]*\):\([0-9]*\)/\1C \2%/g; s/,/, /g' <<< "$curve")"
-        row hysteresis "${hyst}C"
-    else
-        row error "$(tail -n1 <<< "$out")"
-    fi
+    [ -n "$curve" ] || row error "$(tail -n1 <<< "$out")"
 
     # The unit's interval overrides POLL in the config.
     poll=$(sed -n 's|^ExecStart=.*fanctld daemon \([0-9][0-9]*\).*|\1|p' \
            /etc/systemd/system/fanctld.service 2>/dev/null)
     [ -n "$poll" ] || poll=$(conf_get POLL)
-    row poll "every ${poll:-60}s"
+    show_reading "${poll:-60}"
 
-    echo
-    t=$(state_get time)
-    if [ -z "$t" ]; then
-        if systemctl is-active -q fanctld.service 2>/dev/null; then
-            row disks "waiting for the first poll"
-        else
-            row disks "no reading - fanctld is not running"
-        fi
-        return
-    fi
-    row polled "$(state_get at), $(ago $(( $(date +%s) - t )))"
-    out=$(state_get error)
-    if [ -n "$out" ]; then
-        row error "$out"
-        if [ "$(state_get failsafe)" = 1 ]; then
-            row "" "fans at 100% until TrueNAS answers ($(state_get failures) failed polls)"
-        fi
-    else
-        show_disks
-        speed=$(state_get speed); want=$(state_get curve)
-        if [ -n "$want" ] && [ "$want" != "$speed" ]; then
-            row hottest "$(state_get hottest)C -> ${want}%, held at ${speed}% by hysteresis"
-        else
-            row hottest "$(state_get hottest)C -> ${speed}%"
-        fi
+    if [ -n "$curve" ]; then
+        echo
+        show_curve "$curve" "$hyst" "$(state_get hottest)"
     fi
 }
 
