@@ -146,21 +146,24 @@ ago() {
     fi
 }
 
-# The disks from the last poll, hottest first, six to a row.
-show_disks() {
-    local d line="" n=0 label=disks
+# The disks from the last poll, hottest first. A bar runs from 20C, about
+# room temperature, to the top of the curve, where the fans run flat out.
+show_disks() {  # temperature at the top of the curve
+    local d temp pct top=$1
+    [ "$top" -gt 20 ] 2>/dev/null || top=60
+    echo "DISKS"
     for d in $(state_get disks); do
-        line="$line${line:+   }${d%%:*} ${d#*:}C"
-        n=$(( n + 1 ))
-        if [ "$n" -eq 6 ]; then row "$label" "$line"; label=""; line=""; n=0; fi
+        temp=${d#*:}
+        pct=$(( (temp - 20) * 100 / (top - 20) ))
+        [ "$pct" -lt 0 ] && pct=0
+        printf "  %-11s %-5s [%s]\n" "${d%%:*}" "${temp}C" "$(bar "$pct")"
     done
-    [ -n "$line" ] && row "$label" "$line"
 }
 
 # The curve as temperature bands, like `fanctld curve`, marking the band
 # the hottest disk is in.
 show_curve() {  # points "0:35,36:45,...", hysteresis, hottest or ""
-    local pts=(${1//,/ }) i low pct upper band mark
+    local pts=(${1//,/ }) i low pct upper band
     echo "CURVE  hysteresis ${2}C"
     for (( i = 0; i < ${#pts[@]}; i++ )); do
         low=${pts[i]%%:*}; pct=${pts[i]#*:}; upper=""
@@ -169,18 +172,18 @@ show_curve() {  # points "0:35,36:45,...", hysteresis, hottest or ""
         else
             band=">= ${low}C"
         fi
-        mark=""
         if [ -n "$3" ] && [ "$3" -ge "$low" ] &&
            { [ -z "$upper" ] || [ "$3" -lt "$upper" ]; }; then
-            mark="  <- ${3}C"
+            printf "  %-11s %-5s ← %sC\n" "$band" "$pct%" "$3"
+        else
+            printf "  %-11s %s\n" "$band" "$pct%"
         fi
-        printf "  %-11s %-5s [%s]%s\n" "$band" "$pct%" "$(bar "$pct")" "$mark"
     done
 }
 
 # The last poll fanctld left in $STATE.
-show_reading() {  # poll interval
-    local t out speed want
+show_reading() {  # poll interval, temperature at the top of the curve
+    local t out speed want hot
     t=$(state_get time)
     if [ -z "$t" ]; then
         if systemctl is-active -q fanctld.service 2>/dev/null; then
@@ -199,19 +202,20 @@ show_reading() {  # poll interval
         fi
         return
     fi
-    show_disks
-    speed=$(state_get speed); want=$(state_get curve)
+    speed=$(state_get speed); want=$(state_get curve); hot=$(state_get hottest)
     if [ -n "$want" ] && [ "$want" != "$speed" ]; then
-        row hottest "$(state_get hottest)C -> ${want}%, held at ${speed}% by hysteresis"
+        row target "${speed}%, held by hysteresis (curve: ${want}% at ${hot}C)"
     else
-        row hottest "$(state_get hottest)C -> ${speed}%"
+        row target "${speed}% for the hottest disk (${hot}C)"
     fi
+    echo
+    show_disks "$2"
 }
 
 # The TrueNAS side: the config, and the daemon's last poll. Only the
 # daemon talks to TrueNAS, so refreshing this costs it nothing.
 show_truenas() {
-    local out="" curve="" hyst="" poll
+    local out="" curve="" hyst="" poll top
     echo "TRUENAS"
     if [ ! -e "$CONF" ]; then
         echo "  not set up"
@@ -239,7 +243,8 @@ show_truenas() {
     poll=$(sed -n 's|^ExecStart=.*fanctld daemon \([0-9][0-9]*\).*|\1|p' \
            /etc/systemd/system/fanctld.service 2>/dev/null)
     [ -n "$poll" ] || poll=$(conf_get POLL)
-    show_reading "${poll:-60}"
+    top=${curve##*,}
+    show_reading "${poll:-60}" "${top%%:*}"
 
     if [ -n "$curve" ]; then
         echo

@@ -303,18 +303,13 @@ def format_curve(curve):
     return ",".join(f"{t}:{p}" for t, p in curve)
 
 
-def bar(pct):
-    filled = min(pct, 100) * 20 // 100
-    return "[" + "#" * filled + "." * (20 - filled) + "]"
-
-
 def curve_table(curve, hysteresis):
     """The curve as temperature bands, laid out like `fanctl status`."""
     lines = [f"CURVE  hysteresis {hysteresis}C"]
     for i, (low, pct) in enumerate(curve):
         upper = curve[i + 1][0] if i + 1 < len(curve) else None
         band = f"{low}-{upper - 1}C" if upper else f">= {low}C"
-        lines.append(f"  {band:<11} {str(pct) + '%':<5} {bar(pct)}")
+        lines.append(f"  {band:<11} {pct}%")
     return "\n".join(lines)
 
 
