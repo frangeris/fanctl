@@ -6,6 +6,7 @@ the PWM duty on the Proxmox host. Fails safe to 100% when TrueNAS is
 unreachable.
 
 Config: /etc/fanctld.conf  (mode 600)
+State:  /run/fanctld.state  (last poll, shown by `fanctl status`)
 
     TRUENAS_HOST=192.168.1.121
     TRUENAS_KEY=<api key>
@@ -41,6 +42,7 @@ except ImportError:
 CONF_PATH = "/etc/fanctld.conf"
 CAL_PATH = "/etc/fanctl.max"
 PWM_PATH = "/etc/fanctl.pwm"
+STATE_PATH = "/run/fanctld.state"
 PWM_MAX = 255
 
 DEFAULT_CURVE = [(0, 35), (36, 45), (40, 55), (43, 70), (46, 85), (50, 100)]
@@ -301,13 +303,18 @@ def format_curve(curve):
     return ",".join(f"{t}:{p}" for t, p in curve)
 
 
-def curve_table(curve):
-    lines = [f"{'TEMP':<12} {'SPEED':<7} LEVEL", "-" * 46]
-    for i, (temp, pct) in enumerate(curve):
+def bar(pct):
+    filled = min(pct, 100) * 20 // 100
+    return "[" + "#" * filled + "." * (20 - filled) + "]"
+
+
+def curve_table(curve, hysteresis):
+    """The curve as temperature bands, laid out like `fanctl status`."""
+    lines = [f"CURVE  hysteresis {hysteresis}C"]
+    for i, (low, pct) in enumerate(curve):
         upper = curve[i + 1][0] if i + 1 < len(curve) else None
-        band = f"{temp}-{upper - 1}C" if upper else f">= {temp}C"
-        bar = "#" * (pct * 20 // 100) + "." * (20 - pct * 20 // 100)
-        lines.append(f"{band:<12} {str(pct) + '%':<7} [{bar}]")
+        band = f"{low}-{upper - 1}C" if upper else f">= {low}C"
+        lines.append(f"  {band:<11} {str(pct) + '%':<5} {bar(pct)}")
     return "\n".join(lines)
 
 
@@ -332,6 +339,24 @@ def speed_for_temp(temp, curve, current=None, hysteresis=DEFAULT_HYSTERESIS):
     return want
 
 
+def save_state(**fields):
+    """Leave the last poll where `fanctl status` can read it.
+
+    Only the daemon talks to TrueNAS; status refreshes every couple of
+    seconds and must not add API calls of its own.
+    """
+    fields["time"] = int(time.time())
+    fields["at"] = time.strftime("%H:%M:%S")
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            for key, value in fields.items():
+                f.write(f"{key}={' '.join(str(value).split())}\n")
+        os.replace(tmp, STATE_PATH)
+    except OSError as exc:
+        log.debug("cannot write %s: %s", STATE_PATH, exc)
+
+
 def poll_temps(conf):
     with TrueNAS(conf["TRUENAS_HOST"], conf["TRUENAS_KEY"]) as nas:
         temps = nas.disk_temps()
@@ -353,35 +378,14 @@ def cmd_once(fan, conf, apply_change=True):
     return hottest, want
 
 
-def cmd_status(fan, conf):
-    duty = fan.read_duty()
-    rpm = fan.read_rpm()
-    print(f"{'FAN':<10} {'RPM':<7} {'SPEED':<7} {'DUTY'}")
-    print("-" * 40)
-    print(f"{'pwm' + str(fan.channel):<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
-          f"{duty}/255   (max {fan.max_rpm} RPM)")
-    print()
-    try:
-        temps = poll_temps(conf)
-    except Exception as exc:
-        print(f"TrueNAS unreachable: {exc}")
-        return
-    print(f"{'DISK':<8} {'TEMP'}")
-    print("-" * 40)
-    for name, temp in sorted(temps.items(), key=lambda kv: -kv[1]):
-        mark = "  <-- hot" if temp >= 46 else ""
-        print(f"{name:<8} {temp:.0f}C{mark}")
-    hottest = max(temps.values())
-    print(f"\nhottest {hottest:.0f}C -> curve says "
-          f"{speed_for_temp(hottest, conf['CURVE'])}%")
-    print()
-    print(curve_table(conf["CURVE"]))
-
-
 def cmd_daemon(fan, conf, interval=None):
     def bail(_sig, _frm):
-        log.warning("shutting down - fans to 100%%")
+        log.warning("shutting down - fans to 100%")
         fan.set_duty(PWM_MAX)
+        try:
+            os.remove(STATE_PATH)
+        except OSError:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, bail)
@@ -408,14 +412,24 @@ def cmd_daemon(fan, conf, interval=None):
                 last_pct = want
             else:
                 log.debug("hdd max %.0fC, holding %d%%", hottest, want)
+            save_state(disks=" ".join(f"{name}:{temp:.0f}" for name, temp in
+                                      sorted(temps.items(), key=lambda kv: -kv[1])),
+                       hottest=f"{hottest:.0f}", speed=last_pct,
+                       curve=lookup(hottest, curve))
         except Exception as exc:
             failures += 1
-            log.error("poll failed (%d/%d): %s", failures, FAIL_LIMIT, exc)
+            if failures < FAIL_LIMIT:
+                log.error("poll failed (%d/%d): %s", failures, FAIL_LIMIT, exc)
+            else:
+                log.error("poll failed (%d in a row, fans at 100%%): %s",
+                          failures, exc)
             if failures >= FAIL_LIMIT:
                 if last_pct != 100:
-                    log.warning("TrueNAS unreachable - forcing 100%%")
+                    log.warning("TrueNAS unreachable - forcing 100%")
                     fan.set_duty(PWM_MAX)
                     last_pct = 100
+            save_state(error=exc, failures=failures,
+                       failsafe=int(failures >= FAIL_LIMIT))
 
         elapsed = time.monotonic() - started
         time.sleep(max(1.0, interval - elapsed))
@@ -425,9 +439,9 @@ def cmd_curve(conf, args):
     curve = conf["CURVE"]
 
     if not args:
-        print(curve_table(curve))
+        print(curve_table(curve, conf["HYSTERESIS"]))
         print(f"\nCURVE={format_curve(curve)}")
-        print(f"HYSTERESIS={conf['HYSTERESIS']}C")
+        print(f"HYSTERESIS={conf['HYSTERESIS']}")
         return
 
     action, rest = args[0], args[1:]
@@ -440,7 +454,7 @@ def cmd_curve(conf, args):
         except ValueError as exc:
             sys.exit(f"Bad curve: {exc}")
         write_conf_key("CURVE", format_curve(new))
-        print(curve_table(new))
+        print(curve_table(new, conf["HYSTERESIS"]))
         print(f"\nSaved to {CONF_PATH}.")
         print("Apply it with:  systemctl restart fanctld")
         return
@@ -506,8 +520,7 @@ def main():
                '  fanctld curve test 44\n',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
-                    choices=["status", "once", "dry-run", "daemon", "curve",
-                             "init"])
+                    choices=["once", "dry-run", "daemon", "curve", "init"])
     ap.add_argument("args", nargs="*",
                     help="daemon: poll interval in seconds. "
                          "curve: set|hysteresis|test plus its argument.")
@@ -530,8 +543,6 @@ def main():
 
     fan = Fan(find_hwmon())
 
-    if args.command == "status":
-        return cmd_status(fan, conf)
     if args.command == "once":
         return cmd_once(fan, conf)
     if args.command == "dry-run":

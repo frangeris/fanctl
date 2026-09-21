@@ -25,6 +25,7 @@ PWM=""
 PWM_PATH=/etc/fanctl.pwm
 CAL=/etc/fanctl.max
 CONF=/etc/fanctld.conf
+STATE=/run/fanctld.state
 
 read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
 read_duty() { cat "$HWMON/pwm$PWM"; }
@@ -132,10 +133,31 @@ conf_get() {
         sed "s/[[:space:]]*\$//; s/^[\"']//; s/[\"']\$//"
 }
 
-# The TrueNAS side, from the config and the daemon's journal. It never
-# calls TrueNAS itself, so watch can run it every couple of seconds.
+state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null; }
+
+ago() {
+    local s=$1
+    if [ "$s" -lt 120 ]; then echo "${s}s ago"
+    elif [ "$s" -lt 7200 ]; then echo "$(( s / 60 ))m ago"
+    else echo "$(( s / 3600 ))h ago"
+    fi
+}
+
+# The disks from the last poll, hottest first, six to a row.
+show_disks() {
+    local d line="" n=0 label=disks
+    for d in $(state_get disks); do
+        line="$line${line:+   }${d%%:*} ${d#*:}C"
+        n=$(( n + 1 ))
+        if [ "$n" -eq 6 ]; then row "$label" "$line"; label=""; line=""; n=0; fi
+    done
+    [ -n "$line" ] && row "$label" "$line"
+}
+
+# The TrueNAS side: the config, and the last poll fanctld left in $STATE.
+# Only the daemon talks to TrueNAS, so refreshing this costs it nothing.
 show_truenas() {
-    local out="" curve="" hyst="" poll last
+    local out="" curve="" hyst="" poll t speed want
     echo "TRUENAS"
     if [ ! -e "$CONF" ]; then
         echo "  not set up"
@@ -148,11 +170,6 @@ show_truenas() {
 
     out=$(conf_get TRUENAS_HOST)
     row host "${out:-missing}"
-    if [ -n "$(conf_get TRUENAS_KEY)" ]; then
-        row "api key" "✓"
-    else
-        row "api key" "✗ missing"
-    fi
 
     # fanctld knows the defaults and validates the curve, so ask it.
     if command -v fanctld >/dev/null; then
@@ -164,7 +181,7 @@ show_truenas() {
     fi
     if [ -n "$curve" ]; then
         row curve "$(sed 's/\([0-9]*\):\([0-9]*\)/\1C \2%/g; s/,/, /g' <<< "$curve")"
-        row hysteresis "$hyst"
+        row hysteresis "${hyst}C"
     else
         row error "$(tail -n1 <<< "$out")"
     fi
@@ -175,13 +192,32 @@ show_truenas() {
     [ -n "$poll" ] || poll=$(conf_get POLL)
     row poll "every ${poll:-60}s"
 
-    # fanctld only logs when the speed changes, so the date matters: take
-    # journald's, not the time inside the message.
-    last=$(journalctl -u fanctld.service -n 20 -o short -q --no-pager 2>/dev/null |
-           grep -E ' (INFO|WARNING|ERROR) ' | tail -n1 |
-           sed 's/^\([A-Z][a-z]* *[0-9]* [0-9:]*\) [^ ]* [^:]*: [0-9:]* /\1 /')
-    [ -n "$last" ] && row "last log" "${last/ INFO / }"
-    row "disk temps" "run: fanctld status"
+    echo
+    t=$(state_get time)
+    if [ -z "$t" ]; then
+        if systemctl is-active -q fanctld.service 2>/dev/null; then
+            row disks "waiting for the first poll"
+        else
+            row disks "no reading - fanctld is not running"
+        fi
+        return
+    fi
+    row polled "$(state_get at), $(ago $(( $(date +%s) - t )))"
+    out=$(state_get error)
+    if [ -n "$out" ]; then
+        row error "$out"
+        if [ "$(state_get failsafe)" = 1 ]; then
+            row "" "fans at 100% until TrueNAS answers ($(state_get failures) failed polls)"
+        fi
+    else
+        show_disks
+        speed=$(state_get speed); want=$(state_get curve)
+        if [ -n "$want" ] && [ "$want" != "$speed" ]; then
+            row hottest "$(state_get hottest)C -> ${want}%, held at ${speed}% by hysteresis"
+        else
+            row hottest "$(state_get hottest)C -> ${speed}%"
+        fi
+    fi
 }
 
 # Everything that is set up, and what is still missing.
@@ -255,12 +291,20 @@ cmd_set() {
     echo "fan -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
 }
 
-cmd_watch() {
-    local interval=${1:-2}
+# status refreshes until Ctrl-C. Piped or scripted, it prints once.
+cmd_live() {
+    local interval=$1 out
+    if [ "$interval" = "--once" ] || [ ! -t 1 ]; then
+        cmd_status
+        return
+    fi
     trap 'echo; exit 0' INT
     while true; do
-        clear; date '+%H:%M:%S'; echo
-        cmd_status
+        # Build the screen first, so it does not flicker while fanctld runs.
+        out=$(cmd_status)
+        clear
+        echo "$(date '+%H:%M:%S')  every ${interval}s, Ctrl-C to quit"; echo
+        echo "$out"
         sleep "$interval"
     done
 }
@@ -353,8 +397,8 @@ fanctl - case fans, controlled by SPEED percentage
   fanctl pwm <n>     Set the channel directly
   fanctl calibrate   Measure max RPM (run once)
   fanctl <pct>       Set speed to <pct>% of max RPM
-  fanctl status      Show speed, channel, mode and TrueNAS setup
-  fanctl watch [s]   Live view
+  fanctl status [s]  Live view of speed, channel, mode and TrueNAS setup,
+                     every s seconds (default 2). --once prints it once.
   fanctl max         100%
 
   fanctl 60          -> 60% of max RPM
@@ -362,11 +406,10 @@ EOF
 }
 
 case "${1:-}" in
-    pwm)       cmd_pwm "${2:-}" ;;
-    calibrate) require_pwm; cmd_calibrate ;;
-    status)    cmd_status ;;
-    watch)     cmd_watch "${2:-2}" ;;
-    max)       require_pwm; cmd_set 100 ;;
-    [0-9]*)    require_pwm; cmd_set "$1" ;;
-    *)         usage ;;
+    pwm)          cmd_pwm "${2:-}" ;;
+    calibrate)    require_pwm; cmd_calibrate ;;
+    status|watch) cmd_live "${2:-2}" ;;
+    max)          require_pwm; cmd_set 100 ;;
+    [0-9]*)       require_pwm; cmd_set "$1" ;;
+    *)            usage ;;
 esac

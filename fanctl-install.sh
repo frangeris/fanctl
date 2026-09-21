@@ -302,6 +302,7 @@ PWM=""
 PWM_PATH=/etc/fanctl.pwm
 CAL=/etc/fanctl.max
 CONF=/etc/fanctld.conf
+STATE=/run/fanctld.state
 
 read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
 read_duty() { cat "$HWMON/pwm$PWM"; }
@@ -409,10 +410,31 @@ conf_get() {
         sed "s/[[:space:]]*\$//; s/^[\"']//; s/[\"']\$//"
 }
 
-# The TrueNAS side, from the config and the daemon's journal. It never
-# calls TrueNAS itself, so watch can run it every couple of seconds.
+state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null; }
+
+ago() {
+    local s=$1
+    if [ "$s" -lt 120 ]; then echo "${s}s ago"
+    elif [ "$s" -lt 7200 ]; then echo "$(( s / 60 ))m ago"
+    else echo "$(( s / 3600 ))h ago"
+    fi
+}
+
+# The disks from the last poll, hottest first, six to a row.
+show_disks() {
+    local d line="" n=0 label=disks
+    for d in $(state_get disks); do
+        line="$line${line:+   }${d%%:*} ${d#*:}C"
+        n=$(( n + 1 ))
+        if [ "$n" -eq 6 ]; then row "$label" "$line"; label=""; line=""; n=0; fi
+    done
+    [ -n "$line" ] && row "$label" "$line"
+}
+
+# The TrueNAS side: the config, and the last poll fanctld left in $STATE.
+# Only the daemon talks to TrueNAS, so refreshing this costs it nothing.
 show_truenas() {
-    local out="" curve="" hyst="" poll last
+    local out="" curve="" hyst="" poll t speed want
     echo "TRUENAS"
     if [ ! -e "$CONF" ]; then
         echo "  not set up"
@@ -425,11 +447,6 @@ show_truenas() {
 
     out=$(conf_get TRUENAS_HOST)
     row host "${out:-missing}"
-    if [ -n "$(conf_get TRUENAS_KEY)" ]; then
-        row "api key" "✓"
-    else
-        row "api key" "✗ missing"
-    fi
 
     # fanctld knows the defaults and validates the curve, so ask it.
     if command -v fanctld >/dev/null; then
@@ -441,7 +458,7 @@ show_truenas() {
     fi
     if [ -n "$curve" ]; then
         row curve "$(sed 's/\([0-9]*\):\([0-9]*\)/\1C \2%/g; s/,/, /g' <<< "$curve")"
-        row hysteresis "$hyst"
+        row hysteresis "${hyst}C"
     else
         row error "$(tail -n1 <<< "$out")"
     fi
@@ -452,13 +469,32 @@ show_truenas() {
     [ -n "$poll" ] || poll=$(conf_get POLL)
     row poll "every ${poll:-60}s"
 
-    # fanctld only logs when the speed changes, so the date matters: take
-    # journald's, not the time inside the message.
-    last=$(journalctl -u fanctld.service -n 20 -o short -q --no-pager 2>/dev/null |
-           grep -E ' (INFO|WARNING|ERROR) ' | tail -n1 |
-           sed 's/^\([A-Z][a-z]* *[0-9]* [0-9:]*\) [^ ]* [^:]*: [0-9:]* /\1 /')
-    [ -n "$last" ] && row "last log" "${last/ INFO / }"
-    row "disk temps" "run: fanctld status"
+    echo
+    t=$(state_get time)
+    if [ -z "$t" ]; then
+        if systemctl is-active -q fanctld.service 2>/dev/null; then
+            row disks "waiting for the first poll"
+        else
+            row disks "no reading - fanctld is not running"
+        fi
+        return
+    fi
+    row polled "$(state_get at), $(ago $(( $(date +%s) - t )))"
+    out=$(state_get error)
+    if [ -n "$out" ]; then
+        row error "$out"
+        if [ "$(state_get failsafe)" = 1 ]; then
+            row "" "fans at 100% until TrueNAS answers ($(state_get failures) failed polls)"
+        fi
+    else
+        show_disks
+        speed=$(state_get speed); want=$(state_get curve)
+        if [ -n "$want" ] && [ "$want" != "$speed" ]; then
+            row hottest "$(state_get hottest)C -> ${want}%, held at ${speed}% by hysteresis"
+        else
+            row hottest "$(state_get hottest)C -> ${speed}%"
+        fi
+    fi
 }
 
 # Everything that is set up, and what is still missing.
@@ -532,12 +568,20 @@ cmd_set() {
     echo "fan -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
 }
 
-cmd_watch() {
-    local interval=${1:-2}
+# status refreshes until Ctrl-C. Piped or scripted, it prints once.
+cmd_live() {
+    local interval=$1 out
+    if [ "$interval" = "--once" ] || [ ! -t 1 ]; then
+        cmd_status
+        return
+    fi
     trap 'echo; exit 0' INT
     while true; do
-        clear; date '+%H:%M:%S'; echo
-        cmd_status
+        # Build the screen first, so it does not flicker while fanctld runs.
+        out=$(cmd_status)
+        clear
+        echo "$(date '+%H:%M:%S')  every ${interval}s, Ctrl-C to quit"; echo
+        echo "$out"
         sleep "$interval"
     done
 }
@@ -630,8 +674,8 @@ fanctl - case fans, controlled by SPEED percentage
   fanctl pwm <n>     Set the channel directly
   fanctl calibrate   Measure max RPM (run once)
   fanctl <pct>       Set speed to <pct>% of max RPM
-  fanctl status      Show speed, channel, mode and TrueNAS setup
-  fanctl watch [s]   Live view
+  fanctl status [s]  Live view of speed, channel, mode and TrueNAS setup,
+                     every s seconds (default 2). --once prints it once.
   fanctl max         100%
 
   fanctl 60          -> 60% of max RPM
@@ -639,13 +683,12 @@ EOF
 }
 
 case "${1:-}" in
-    pwm)       cmd_pwm "${2:-}" ;;
-    calibrate) require_pwm; cmd_calibrate ;;
-    status)    cmd_status ;;
-    watch)     cmd_watch "${2:-2}" ;;
-    max)       require_pwm; cmd_set 100 ;;
-    [0-9]*)    require_pwm; cmd_set "$1" ;;
-    *)         usage ;;
+    pwm)          cmd_pwm "${2:-}" ;;
+    calibrate)    require_pwm; cmd_calibrate ;;
+    status|watch) cmd_live "${2:-2}" ;;
+    max)          require_pwm; cmd_set 100 ;;
+    [0-9]*)       require_pwm; cmd_set "$1" ;;
+    *)            usage ;;
 esac
 FANCTL_EOF
 
@@ -750,6 +793,7 @@ the PWM duty on the Proxmox host. Fails safe to 100% when TrueNAS is
 unreachable.
 
 Config: /etc/fanctld.conf  (mode 600)
+State:  /run/fanctld.state  (last poll, shown by `fanctl status`)
 
     TRUENAS_HOST=192.168.1.121
     TRUENAS_KEY=<api key>
@@ -785,6 +829,7 @@ except ImportError:
 CONF_PATH = "/etc/fanctld.conf"
 CAL_PATH = "/etc/fanctl.max"
 PWM_PATH = "/etc/fanctl.pwm"
+STATE_PATH = "/run/fanctld.state"
 PWM_MAX = 255
 
 DEFAULT_CURVE = [(0, 35), (36, 45), (40, 55), (43, 70), (46, 85), (50, 100)]
@@ -1045,13 +1090,18 @@ def format_curve(curve):
     return ",".join(f"{t}:{p}" for t, p in curve)
 
 
-def curve_table(curve):
-    lines = [f"{'TEMP':<12} {'SPEED':<7} LEVEL", "-" * 46]
-    for i, (temp, pct) in enumerate(curve):
+def bar(pct):
+    filled = min(pct, 100) * 20 // 100
+    return "[" + "#" * filled + "." * (20 - filled) + "]"
+
+
+def curve_table(curve, hysteresis):
+    """The curve as temperature bands, laid out like `fanctl status`."""
+    lines = [f"CURVE  hysteresis {hysteresis}C"]
+    for i, (low, pct) in enumerate(curve):
         upper = curve[i + 1][0] if i + 1 < len(curve) else None
-        band = f"{temp}-{upper - 1}C" if upper else f">= {temp}C"
-        bar = "#" * (pct * 20 // 100) + "." * (20 - pct * 20 // 100)
-        lines.append(f"{band:<12} {str(pct) + '%':<7} [{bar}]")
+        band = f"{low}-{upper - 1}C" if upper else f">= {low}C"
+        lines.append(f"  {band:<11} {str(pct) + '%':<5} {bar(pct)}")
     return "\n".join(lines)
 
 
@@ -1076,6 +1126,24 @@ def speed_for_temp(temp, curve, current=None, hysteresis=DEFAULT_HYSTERESIS):
     return want
 
 
+def save_state(**fields):
+    """Leave the last poll where `fanctl status` can read it.
+
+    Only the daemon talks to TrueNAS; status refreshes every couple of
+    seconds and must not add API calls of its own.
+    """
+    fields["time"] = int(time.time())
+    fields["at"] = time.strftime("%H:%M:%S")
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            for key, value in fields.items():
+                f.write(f"{key}={' '.join(str(value).split())}\n")
+        os.replace(tmp, STATE_PATH)
+    except OSError as exc:
+        log.debug("cannot write %s: %s", STATE_PATH, exc)
+
+
 def poll_temps(conf):
     with TrueNAS(conf["TRUENAS_HOST"], conf["TRUENAS_KEY"]) as nas:
         temps = nas.disk_temps()
@@ -1097,35 +1165,14 @@ def cmd_once(fan, conf, apply_change=True):
     return hottest, want
 
 
-def cmd_status(fan, conf):
-    duty = fan.read_duty()
-    rpm = fan.read_rpm()
-    print(f"{'FAN':<10} {'RPM':<7} {'SPEED':<7} {'DUTY'}")
-    print("-" * 40)
-    print(f"{'pwm' + str(fan.channel):<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
-          f"{duty}/255   (max {fan.max_rpm} RPM)")
-    print()
-    try:
-        temps = poll_temps(conf)
-    except Exception as exc:
-        print(f"TrueNAS unreachable: {exc}")
-        return
-    print(f"{'DISK':<8} {'TEMP'}")
-    print("-" * 40)
-    for name, temp in sorted(temps.items(), key=lambda kv: -kv[1]):
-        mark = "  <-- hot" if temp >= 46 else ""
-        print(f"{name:<8} {temp:.0f}C{mark}")
-    hottest = max(temps.values())
-    print(f"\nhottest {hottest:.0f}C -> curve says "
-          f"{speed_for_temp(hottest, conf['CURVE'])}%")
-    print()
-    print(curve_table(conf["CURVE"]))
-
-
 def cmd_daemon(fan, conf, interval=None):
     def bail(_sig, _frm):
-        log.warning("shutting down - fans to 100%%")
+        log.warning("shutting down - fans to 100%")
         fan.set_duty(PWM_MAX)
+        try:
+            os.remove(STATE_PATH)
+        except OSError:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, bail)
@@ -1152,14 +1199,24 @@ def cmd_daemon(fan, conf, interval=None):
                 last_pct = want
             else:
                 log.debug("hdd max %.0fC, holding %d%%", hottest, want)
+            save_state(disks=" ".join(f"{name}:{temp:.0f}" for name, temp in
+                                      sorted(temps.items(), key=lambda kv: -kv[1])),
+                       hottest=f"{hottest:.0f}", speed=last_pct,
+                       curve=lookup(hottest, curve))
         except Exception as exc:
             failures += 1
-            log.error("poll failed (%d/%d): %s", failures, FAIL_LIMIT, exc)
+            if failures < FAIL_LIMIT:
+                log.error("poll failed (%d/%d): %s", failures, FAIL_LIMIT, exc)
+            else:
+                log.error("poll failed (%d in a row, fans at 100%%): %s",
+                          failures, exc)
             if failures >= FAIL_LIMIT:
                 if last_pct != 100:
-                    log.warning("TrueNAS unreachable - forcing 100%%")
+                    log.warning("TrueNAS unreachable - forcing 100%")
                     fan.set_duty(PWM_MAX)
                     last_pct = 100
+            save_state(error=exc, failures=failures,
+                       failsafe=int(failures >= FAIL_LIMIT))
 
         elapsed = time.monotonic() - started
         time.sleep(max(1.0, interval - elapsed))
@@ -1169,9 +1226,9 @@ def cmd_curve(conf, args):
     curve = conf["CURVE"]
 
     if not args:
-        print(curve_table(curve))
+        print(curve_table(curve, conf["HYSTERESIS"]))
         print(f"\nCURVE={format_curve(curve)}")
-        print(f"HYSTERESIS={conf['HYSTERESIS']}C")
+        print(f"HYSTERESIS={conf['HYSTERESIS']}")
         return
 
     action, rest = args[0], args[1:]
@@ -1184,7 +1241,7 @@ def cmd_curve(conf, args):
         except ValueError as exc:
             sys.exit(f"Bad curve: {exc}")
         write_conf_key("CURVE", format_curve(new))
-        print(curve_table(new))
+        print(curve_table(new, conf["HYSTERESIS"]))
         print(f"\nSaved to {CONF_PATH}.")
         print("Apply it with:  systemctl restart fanctld")
         return
@@ -1250,8 +1307,7 @@ def main():
                '  fanctld curve test 44\n',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command",
-                    choices=["status", "once", "dry-run", "daemon", "curve",
-                             "init"])
+                    choices=["once", "dry-run", "daemon", "curve", "init"])
     ap.add_argument("args", nargs="*",
                     help="daemon: poll interval in seconds. "
                          "curve: set|hysteresis|test plus its argument.")
@@ -1274,8 +1330,6 @@ def main():
 
     fan = Fan(find_hwmon())
 
-    if args.command == "status":
-        return cmd_status(fan, conf)
     if args.command == "once":
         return cmd_once(fan, conf)
     if args.command == "dry-run":
@@ -1322,11 +1376,11 @@ fi
 
 # ------------------------------------------------------------------
 header "Done"
-/usr/local/bin/fanctl status
+/usr/local/bin/fanctl status --once
 cat <<SUMMARY
 
  fanctl 50          set 50% of max RPM
- fanctl watch       live view
+ fanctl status      live view
 SUMMARY
 [ "$MODE" = curve ] && echo " journalctl -u fanctld -f    follow the curve"
 echo

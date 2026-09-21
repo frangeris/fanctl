@@ -103,9 +103,9 @@ afterwards. [docs/hardware.md](docs/hardware.md) shows the manual loop.
 ## Manual use
 
 ```bash
-fanctl status        # speed, channel, chip, mode and TrueNAS setup
+fanctl status        # live: speed, channel, chip, mode, TrueNAS setup
+fanctl status --once # print it once
 fanctl 40            # 40% of max RPM
-fanctl watch         # live view
 fanctl max           # 100%
 fanctl pwm           # find the channel again
 ```
@@ -135,6 +135,10 @@ fanctld dry-run                 # reads temps, touches nothing
 systemctl enable --now fanctld.service
 ```
 
+`fanctl status` then shows every disk's temperature and the speed the
+curve picked. It reads the daemon's last poll from `/run/fanctld.state`,
+so it adds no calls to TrueNAS however often it refreshes.
+
 ### The curve
 
 The curve lives in `/etc/fanctld.conf`, as `temp:speed` points where
@@ -156,14 +160,13 @@ systemctl restart fanctld                        # apply
 ```
 
 ```
-TEMP         SPEED   LEVEL
-----------------------------------------------
-0-35C        35%     [#######.............]
-36-39C       45%     [#########...........]
-40-42C       55%     [###########.........]
-43-45C       70%     [##############......]
-46-49C       85%     [#################...]
->= 50C       100%    [####################]
+CURVE  hysteresis 2C
+  0-35C       35%   [#######.............]
+  36-39C      45%   [#########...........]
+  40-42C      55%   [###########.........]
+  43-45C      70%   [##############......]
+  46-49C      85%   [#################...]
+  >= 50C      100%  [####################]
 ```
 
 The first point must be 0 so the curve always has a floor, and speeds
