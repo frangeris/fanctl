@@ -1,8 +1,9 @@
 #!/bin/bash
-# fanctl - manual case fan control (SYS_FAN1 / ITE IT8686E)
+# fanctl - manual case fan control (ITE Super I/O)
 #
 # Speed is expressed as a percentage of the fan's measured maximum RPM,
-# not as PWM duty. Run `fanctl calibrate` once to record that maximum.
+# not as PWM duty. Run `fanctl pwm` once to find the channel that drives
+# the fans, then `fanctl calibrate` to record their maximum.
 
 set -u
 
@@ -10,20 +11,18 @@ HWMON=""
 for h in /sys/class/hwmon/hwmon*; do
     [ -f "$h/name" ] || continue
     case "$(cat "$h/name")" in
-        it8686*) HWMON="$h"; break ;;
+        it86*|it87*) HWMON="$h"; break ;;
     esac
 done
 
 if [ -z "$HWMON" ]; then
-    echo "ERROR: it8686 chip not found." >&2
-    echo "Load it with: modprobe it87 force_id=0x8686 ignore_resource_conflict=1" >&2
+    echo "ERROR: it87 chip not found." >&2
+    echo "Load it with: modprobe it87  (options in /etc/modprobe.d/it87.conf)" >&2
     exit 1
 fi
 
-# Channel 2 drives the physical SYS_FAN1 header on the B450M DS3H V2.
-# The numbering does not match the silkscreen because the driver is
-# forced with an ID that is not this chip's. See docs/hardware.md.
-PWM=2
+PWM=""
+PWM_PATH=/etc/fanctl.pwm
 CAL=/etc/fanctl.max
 
 read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
@@ -33,7 +32,19 @@ write_duty() {
     echo 1 > "$HWMON/pwm${PWM}_enable" 2>/dev/null
     if ! echo "$1" > "$HWMON/pwm$PWM" 2>/dev/null; then
         echo "ERROR: chip refused the write (header in automatic mode)." >&2
-        echo "BIOS -> Smart Fan 5 -> SYS_FAN1 -> Full Speed" >&2
+        echo "Set the fans to Full Speed in the BIOS." >&2
+        exit 1
+    fi
+}
+
+require_pwm() {
+    if [ ! -s "$PWM_PATH" ]; then
+        echo "No PWM channel set. Run first:  fanctl pwm" >&2
+        exit 1
+    fi
+    PWM=$(cat "$PWM_PATH")
+    if [ ! -f "$HWMON/pwm$PWM" ]; then
+        echo "Bad channel in $PWM_PATH. Run: fanctl pwm" >&2
         exit 1
     fi
 }
@@ -80,9 +91,9 @@ cmd_status() {
     rpm=$(read_rpm)
     duty=$(read_duty)
     spct=$(( rpm * 100 / MAX ))
-    printf "%-10s %-6s %-22s %s\n" "SPEED" "RPM" "LEVEL" "DUTY"
-    printf -- "-%.0s" {1..58}; echo
-    printf "%-9s%% %-6s [%s] %s/255\n" "$spct" "$rpm" "$(bar "$spct")" "$duty"
+    printf "%-10s %-6s %-22s %-8s %s\n" "SPEED" "RPM" "LEVEL" "DUTY" "CHANNEL"
+    printf -- "-%.0s" {1..66}; echo
+    printf "%-9s%% %-6s [%s] %-8s pwm%s\n" "$spct" "$rpm" "$(bar "$spct")" "$duty/255" "$PWM"
 }
 
 cmd_set() {
@@ -93,12 +104,12 @@ cmd_set() {
 
     if [ "$want" -eq 0 ]; then
         write_duty 0
-        echo "SYS_FAN1 -> stopped"
+        echo "fan -> stopped"
         return
     fi
     if [ "$want" -eq 100 ]; then
         write_duty 255
-        echo "SYS_FAN1 -> 100% speed (~${MAX} RPM)"
+        echo "fan -> 100% speed (~${MAX} RPM)"
         return
     fi
 
@@ -125,7 +136,7 @@ cmd_set() {
     write_duty "$best_d"
     sleep 3
     rpm=$(read_rpm)
-    echo "SYS_FAN1 -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
+    echo "fan -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
 }
 
 cmd_watch() {
@@ -138,10 +149,92 @@ cmd_watch() {
     done
 }
 
+ask() {
+    local a
+    read -rp "$1 [y/N] " a </dev/tty
+    [[ "${a,,}" == y* ]]
+}
+
+save_pwm() {
+    local p=$1 old
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ ! -f "$HWMON/pwm$p" ]; then
+        echo "No pwm$p on this chip." >&2
+        exit 1
+    fi
+    old=$(cat "$PWM_PATH" 2>/dev/null)
+    echo "$p" > "$PWM_PATH"
+    if [ "$old" = "$p" ]; then
+        echo "Channel: pwm$p (unchanged)"
+        return
+    fi
+    # A maximum measured on another channel's tachometer is meaningless.
+    rm -f "$CAL"
+    echo "Channel: pwm$p  (saved to $PWM_PATH)"
+    echo "Next:    fanctl calibrate"
+}
+
+# With a forced chip ID the channel numbers do not match the silkscreen,
+# and a tachometer can track its own PWM register without any real fan
+# behind it. The only reliable test is watching the blades.
+cmd_pwm() {
+    if [ -n "${1:-}" ]; then
+        save_pwm "$1"
+        return
+    fi
+
+    if systemctl is-active -q fanctld.service 2>/dev/null; then
+        echo "Stopping fanctld while testing. Start it again when done."
+        systemctl stop fanctld.service
+    fi
+
+    echo "Open the case and watch the fans."
+    echo "Each channel runs 5s fast, then 5s slow."
+
+    local f p found=""
+    for f in "$HWMON"/pwm[0-9]; do
+        p=${f##*pwm}
+        echo; echo "=== pwm$p ==="
+        echo 1 > "$HWMON/pwm${p}_enable" 2>/dev/null
+        if ! echo 255 > "$f" 2>/dev/null; then
+            echo "pwm$p refuses writes - skipping"
+            continue
+        fi
+        sleep 5
+        echo 30 > "$f"
+        sleep 5
+        if ask "Did the fans slow down?"; then
+            echo 255 > "$f"
+            found=$p
+            break
+        fi
+        echo 255 > "$f"
+    done
+
+    if [ -z "$found" ]; then
+        echo "No channel moved the fans. Check they are on a PWM header" >&2
+        echo "and set to Full Speed in the BIOS." >&2
+        exit 1
+    fi
+
+    # A hasty yes on the channel whose reading moves but whose fans do
+    # not would poison the calibration, so test it once more.
+    echo 30 > "$HWMON/pwm$found"
+    sleep 6
+    if ! ask "pwm$found is at 30/255 now. Are the fans clearly slower?"; then
+        echo 255 > "$HWMON/pwm$found"
+        echo "Not confirmed. Run fanctl pwm again, or set it: fanctl pwm <n>" >&2
+        exit 1
+    fi
+    echo 255 > "$HWMON/pwm$found"
+    save_pwm "$found"
+}
+
 usage() {
     cat <<EOF
-fanctl - case fans (SYS_FAN1), controlled by SPEED percentage
+fanctl - case fans, controlled by SPEED percentage
 
+  fanctl pwm         Find the channel that drives the fans (run once)
+  fanctl pwm <n>     Set the channel directly
   fanctl calibrate   Measure max RPM (run once)
   fanctl <pct>       Set speed to <pct>% of max RPM
   fanctl status      Show current speed
@@ -153,10 +246,11 @@ EOF
 }
 
 case "${1:-}" in
-    calibrate) cmd_calibrate ;;
-    status)    cmd_status ;;
-    watch)     cmd_watch "${2:-2}" ;;
-    max)       cmd_set 100 ;;
-    [0-9]*)    cmd_set "$1" ;;
+    pwm)       cmd_pwm "${2:-}" ;;
+    calibrate) require_pwm; cmd_calibrate ;;
+    status)    require_pwm; cmd_status ;;
+    watch)     require_pwm; cmd_watch "${2:-2}" ;;
+    max)       require_pwm; cmd_set 100 ;;
+    [0-9]*)    require_pwm; cmd_set "$1" ;;
     *)         usage ;;
 esac

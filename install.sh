@@ -24,13 +24,15 @@ cat <<'NEXT'
 
 Installed. Next steps:
 
-  1. BIOS: M.I.T. -> Smart Fan 5 -> SYS_FAN1 -> Full Speed
+  1. BIOS: set the fans to Full Speed.
      Without this the chip keeps the header in automatic mode and
      refuses every write.
 
-  2. fanctl calibrate        measure max RPM once
+  2. fanctl pwm              find the channel that drives the fans
 
-  3. Pick ONE of:
+  3. fanctl calibrate        measure max RPM once
+
+  4. Pick ONE of:
 
      fixed speed:
        sed -i 's|fanctl 40|fanctl <pct>|' /etc/systemd/system/fanctl.service

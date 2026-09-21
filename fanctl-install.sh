@@ -4,8 +4,9 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/frangeris/fanctl/main/fanctl-install.sh)"
 #
 # Case fan control for boards whose ITE Super I/O has no upstream driver.
-# Builds the out-of-tree it87 module, finds which PWM channel actually
-# drives the header, installs fanctl/fanctld and a systemd unit.
+# Builds the out-of-tree it87 module, installs fanctl/fanctld and a
+# systemd unit. `fanctl pwm` finds which PWM channel drives the header,
+# during the install or any time after it.
 #
 # Run it again on an installed host to reconfigure or remove it:
 #
@@ -25,6 +26,7 @@ FORCE_ID="${FANCTL_FORCE_ID:-0x8686}"
 MODPROBE_ARGS="force_id=${FORCE_ID} ignore_resource_conflict=1"
 SRC_DIR=/usr/src/it87-fanctl
 CAL_PATH=/etc/fanctl.max
+PWM_PATH=/etc/fanctl.pwm
 CONF_PATH=/etc/fanctld.conf
 HWMON=""
 PWM_CHANNEL="${FANCTL_PWM:-}"
@@ -35,7 +37,8 @@ CM="${GN}✓${CL}"; CROSS="${RD}✗${CL}"; INFO="${BL}»${CL}"
 msg()      { echo -e " ${INFO} $1"; }
 ok()       { echo -e " ${CM} $1"; }
 warn()     { echo -e " ${YW}!${CL} $1"; }
-die()      { gui_error "$1"; echo -e " ${CROSS} ${RD}$1${CL}" >&2; exit 1; }
+fail()     { echo -e " ${CROSS} ${RD}$1${CL}" >&2; exit 1; }
+die()      { gui_error "$1"; fail "$1"; }
 header()   { echo -e "\n${BL}── $1 ──${CL}"; }
 
 # ------------------------------------------------------------------
@@ -94,14 +97,29 @@ gui_password() {  # title, prompt -> value on stdout
 }
 
 gui_menu() {  # title, text, tag1, item1, tag2, item2 ... -> tag on stdout
-    local t="$1" text="$2"; shift 2
+    local t="$1" text="$2" n=$(( ($# - 2) / 2 )); shift 2
     if [ "$GUI" = 1 ]; then
         whiptail --title "$TITLE" --backtitle "$t" \
-                 --menu "$text" 16 74 4 "$@" 3>&1 1>&2 2>&3
+                 --menu "$text" $(( n + 10 )) 74 "$n" "$@" 3>&1 1>&2 2>&3
     else
-        header "$t"; echo "$text"
-        while [ $# -gt 0 ]; do echo "  $1) $2"; shift 2; done
+        {
+            header "$t"; echo "$text"
+            while [ $# -gt 0 ]; do echo "  $1) $2"; shift 2; done
+        } >&2
         local a; read -rp " Choose: " a </dev/tty; echo "$a"
+    fi
+}
+
+gui_radio() {  # title, text, tag1, item1, tag2, item2 ... -> tag on stdout
+    local t="$1" text="$2" n=$(( ($# - 2) / 2 )) on=ON args=(); shift 2
+    if [ "$GUI" = 1 ]; then
+        # The first entry starts marked, so Enter alone accepts it.
+        while [ $# -gt 0 ]; do args+=("$1" "$2" "$on"); on=OFF; shift 2; done
+        whiptail --title "$TITLE" --backtitle "$t" \
+                 --radiolist "$text" $(( $(box_h "$text" 9) + n )) 74 "$n" \
+                 "${args[@]}" 3>&1 1>&2 2>&3
+    else
+        gui_menu "$t" "$text" "$@"
     fi
 }
 
@@ -131,7 +149,7 @@ Remove all of it?" || exit 0
     systemctl daemon-reload
 
     msg "removing files"
-    rm -f /usr/local/bin/fanctl /usr/local/bin/fanctld "$CAL_PATH" "$CONF_PATH"
+    rm -f /usr/local/bin/fanctl /usr/local/bin/fanctld "$CAL_PATH" "$PWM_PATH" "$CONF_PATH"
     rm -f /etc/modprobe.d/it87.conf
     sed -i '/^it87$/d' /etc/modules 2>/dev/null || true
 
@@ -205,15 +223,10 @@ Continue?" || exit 0
 
 # ------------------------------------------------------------------
 gui_yesno "BIOS prerequisite" \
-"In the BIOS, set the fan header to Full Speed:
-
-  M.I.T. -> PC Health Status -> Smart Fan 5
-    -> SYS_FAN -> Full Speed  (F10 to save)
-
-The fans stay at 100% only until fanctl starts at boot.
+"The fans must be set to Full Speed in the BIOS.
 
 Done?" \
-  || die "Do the BIOS step first, then run this installer again."
+  || fail "Set the fans to Full Speed in the BIOS, then run the installer again."
 
 # ------------------------------------------------------------------
 header "Dependencies"
@@ -259,82 +272,35 @@ grep -qx it87 /etc/modules 2>/dev/null || echo it87 >> /etc/modules
 ok "/etc/modprobe.d/it87.conf and /etc/modules written"
 
 # ------------------------------------------------------------------
-header "PWM channel"
-if [ -n "$PWM_CHANNEL" ]; then
-    ok "using pwm${PWM_CHANNEL} (FANCTL_PWM)"
-else
-    gui_msg "PWM channel" \
-"Open the case and watch the fans.
-
-Each channel runs 5s fast, then 5s slow.
-Then say whether the fans slowed down."
-    for p in 1 2 3 4 5; do
-        [ -f "$HWMON/pwm$p" ] || continue
-        echo -e "\n ${BL}=== pwm$p ===${CL}"
-        echo 1 > "$HWMON/pwm${p}_enable" 2>/dev/null || true
-        if ! echo 255 > "$HWMON/pwm$p" 2>/dev/null; then
-            warn "pwm$p refuses writes - skipping"
-            continue
-        fi
-        sleep 5
-        echo 30 > "$HWMON/pwm$p"; sleep 5
-        if gui_yesno "Channel pwm$p" "Testing pwm$p.
-
-Did the case fans SLOW DOWN?"; then
-            echo 255 > "$HWMON/pwm$p"; PWM_CHANNEL=$p; break
-        fi
-        echo 255 > "$HWMON/pwm$p"
-    done
-    # One channel reports a tachometer that merely tracks its own PWM
-    # register, so the numbers move convincingly while the fans do not.
-    # A hasty yes there poisons everything built on top, so confirm.
-    if [ -n "$PWM_CHANNEL" ]; then
-        echo 1 > "$HWMON/pwm${PWM_CHANNEL}_enable" 2>/dev/null || true
-        echo 30 > "$HWMON/pwm$PWM_CHANNEL"; sleep 6
-        gui_yesno "Confirm pwm${PWM_CHANNEL}" \
-"pwm${PWM_CHANNEL} is at 30/255 right now.
-
-Are the fans clearly SLOWER than a moment ago?
-
-Say no if they are still at full speed: that channel moves the
-reading without moving the fans." || {
-            echo 255 > "$HWMON/pwm$PWM_CHANNEL"
-            die "Channel not confirmed.
-
-Run the installer again and keep going past pwm${PWM_CHANNEL}, or
-set it directly:  FANCTL_PWM=<n>"
-        }
-        echo 255 > "$HWMON/pwm$PWM_CHANNEL"
-    fi
-
-    [ -n "$PWM_CHANNEL" ] || die "No channel moved the fans.
-
-Either the fans are wired to constant 12V rather than a PWM header, or \
-the BIOS still owns the header (Smart Fan 5 not set to Full Speed)."
-    ok "channel found: pwm${PWM_CHANNEL}"
-fi
-
-# ------------------------------------------------------------------
 header "Installing fanctl"
 
-cat > /usr/local/bin/fanctl <<FANCTL_EOF
+cat > /usr/local/bin/fanctl <<'FANCTL_EOF'
 #!/bin/bash
-# Manual case fan control. Speed is a percentage of measured max RPM,
-# not PWM duty. Installed by fanctl-install.sh.
+# fanctl - manual case fan control (ITE Super I/O)
+#
+# Speed is expressed as a percentage of the fan's measured maximum RPM,
+# not as PWM duty. Run `fanctl pwm` once to find the channel that drives
+# the fans, then `fanctl calibrate` to record their maximum.
+
 set -u
 
 HWMON=""
 for h in /sys/class/hwmon/hwmon*; do
-    [ -f "\$h/name" ] || continue
-    case "\$(cat "\$h/name")" in it86*|it87*) HWMON="\$h"; break ;; esac
+    [ -f "$h/name" ] || continue
+    case "$(cat "$h/name")" in
+        it86*|it87*) HWMON="$h"; break ;;
+    esac
 done
-[ -n "\$HWMON" ] || { echo "ERROR: it87 chip not found. modprobe it87 ${MODPROBE_ARGS}" >&2; exit 1; }
 
-PWM=${PWM_CHANNEL}
-CAL=${CAL_PATH}
-FANCTL_EOF
+if [ -z "$HWMON" ]; then
+    echo "ERROR: it87 chip not found." >&2
+    echo "Load it with: modprobe it87  (options in /etc/modprobe.d/it87.conf)" >&2
+    exit 1
+fi
 
-cat >> /usr/local/bin/fanctl <<'FANCTL_EOF'
+PWM=""
+PWM_PATH=/etc/fanctl.pwm
+CAL=/etc/fanctl.max
 
 read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
 read_duty() { cat "$HWMON/pwm$PWM"; }
@@ -343,15 +309,33 @@ write_duty() {
     echo 1 > "$HWMON/pwm${PWM}_enable" 2>/dev/null
     if ! echo "$1" > "$HWMON/pwm$PWM" 2>/dev/null; then
         echo "ERROR: chip refused the write (header in automatic mode)." >&2
-        echo "BIOS -> Smart Fan 5 -> SYS_FAN -> Full Speed" >&2
+        echo "Set the fans to Full Speed in the BIOS." >&2
+        exit 1
+    fi
+}
+
+require_pwm() {
+    if [ ! -s "$PWM_PATH" ]; then
+        echo "No PWM channel set. Run first:  fanctl pwm" >&2
+        exit 1
+    fi
+    PWM=$(cat "$PWM_PATH")
+    if [ ! -f "$HWMON/pwm$PWM" ]; then
+        echo "Bad channel in $PWM_PATH. Run: fanctl pwm" >&2
         exit 1
     fi
 }
 
 require_cal() {
-    [ -s "$CAL" ] || { echo "No calibration. Run: fanctl calibrate" >&2; exit 1; }
+    if [ ! -s "$CAL" ]; then
+        echo "No calibration found. Run first:  fanctl calibrate" >&2
+        exit 1
+    fi
     MAX=$(cat "$CAL")
-    [ "$MAX" -gt 0 ] 2>/dev/null || { echo "Bad calibration in $CAL" >&2; exit 1; }
+    if ! [ "$MAX" -gt 0 ] 2>/dev/null; then
+        echo "Bad calibration in $CAL. Run: fanctl calibrate" >&2
+        exit 1
+    fi
 }
 
 bar() {
@@ -366,9 +350,14 @@ bar() {
 
 cmd_calibrate() {
     echo "Running fan at 100% for 15s..."
-    write_duty 255; sleep 15
+    write_duty 255
+    sleep 15
     local peak=0 r i
-    for i in 1 2 3; do r=$(read_rpm); [ "$r" -gt "$peak" ] && peak=$r; sleep 2; done
+    for i in 1 2 3; do
+        r=$(read_rpm)
+        [ "$r" -gt "$peak" ] && peak=$r
+        sleep 2
+    done
     echo "$peak" > "$CAL"
     echo "Max speed: $peak RPM  (saved to $CAL)"
 }
@@ -376,10 +365,12 @@ cmd_calibrate() {
 cmd_status() {
     require_cal
     local rpm duty spct
-    rpm=$(read_rpm); duty=$(read_duty); spct=$(( rpm * 100 / MAX ))
-    printf "%-10s %-6s %-22s %s\n" "SPEED" "RPM" "LEVEL" "DUTY"
-    printf -- "-%.0s" {1..58}; echo
-    printf "%-9s%% %-6s [%s] %s/255\n" "$spct" "$rpm" "$(bar "$spct")" "$duty"
+    rpm=$(read_rpm)
+    duty=$(read_duty)
+    spct=$(( rpm * 100 / MAX ))
+    printf "%-10s %-6s %-22s %-8s %s\n" "SPEED" "RPM" "LEVEL" "DUTY" "CHANNEL"
+    printf -- "-%.0s" {1..66}; echo
+    printf "%-9s%% %-6s [%s] %-8s pwm%s\n" "$spct" "$rpm" "$(bar "$spct")" "$duty/255" "$PWM"
 }
 
 cmd_set() {
@@ -388,13 +379,24 @@ cmd_set() {
     [ "$want" -lt 0 ] && want=0
     [ "$want" -gt 100 ] && want=100
 
-    if [ "$want" -eq 0 ]; then write_duty 0; echo "fan -> stopped"; return; fi
-    if [ "$want" -eq 100 ]; then write_duty 255; echo "fan -> 100% (~${MAX} RPM)"; return; fi
+    if [ "$want" -eq 0 ]; then
+        write_duty 0
+        echo "fan -> stopped"
+        return
+    fi
+    if [ "$want" -eq 100 ]; then
+        write_duty 255
+        echo "fan -> 100% speed (~${MAX} RPM)"
+        return
+    fi
 
-    target=$(( MAX * want / 100 )); duty=$(( 255 * want / 100 ))
+    target=$(( MAX * want / 100 ))
+    duty=$(( 255 * want / 100 ))
     best_d=$duty; best_err=999999
+
     for i in $(seq 1 10); do
-        write_duty "$duty"; sleep 4
+        write_duty "$duty"
+        sleep 4
         rpm=$(read_rpm)
         err=$(( rpm - target )); [ "$err" -lt 0 ] && err=$(( -err ))
         if [ "$err" -lt "$best_err" ]; then best_err=$err; best_d=$duty; fi
@@ -407,39 +409,176 @@ cmd_set() {
         [ "$duty" -lt 1 ] && duty=1
         [ "$duty" -gt 255 ] && duty=255
     done
-    write_duty "$best_d"; sleep 3; rpm=$(read_rpm)
-    echo "fan -> ${want}% | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
+
+    write_duty "$best_d"
+    sleep 3
+    rpm=$(read_rpm)
+    echo "fan -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
 }
 
 cmd_watch() {
+    local interval=${1:-2}
     trap 'echo; exit 0' INT
-    while true; do clear; date '+%H:%M:%S'; echo; cmd_status; sleep "${1:-2}"; done
+    while true; do
+        clear; date '+%H:%M:%S'; echo
+        cmd_status
+        sleep "$interval"
+    done
+}
+
+ask() {
+    local a
+    read -rp "$1 [y/N] " a </dev/tty
+    [[ "${a,,}" == y* ]]
+}
+
+save_pwm() {
+    local p=$1 old
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ ! -f "$HWMON/pwm$p" ]; then
+        echo "No pwm$p on this chip." >&2
+        exit 1
+    fi
+    old=$(cat "$PWM_PATH" 2>/dev/null)
+    echo "$p" > "$PWM_PATH"
+    if [ "$old" = "$p" ]; then
+        echo "Channel: pwm$p (unchanged)"
+        return
+    fi
+    # A maximum measured on another channel's tachometer is meaningless.
+    rm -f "$CAL"
+    echo "Channel: pwm$p  (saved to $PWM_PATH)"
+    echo "Next:    fanctl calibrate"
+}
+
+# With a forced chip ID the channel numbers do not match the silkscreen,
+# and a tachometer can track its own PWM register without any real fan
+# behind it. The only reliable test is watching the blades.
+cmd_pwm() {
+    if [ -n "${1:-}" ]; then
+        save_pwm "$1"
+        return
+    fi
+
+    if systemctl is-active -q fanctld.service 2>/dev/null; then
+        echo "Stopping fanctld while testing. Start it again when done."
+        systemctl stop fanctld.service
+    fi
+
+    echo "Open the case and watch the fans."
+    echo "Each channel runs 5s fast, then 5s slow."
+
+    local f p found=""
+    for f in "$HWMON"/pwm[0-9]; do
+        p=${f##*pwm}
+        echo; echo "=== pwm$p ==="
+        echo 1 > "$HWMON/pwm${p}_enable" 2>/dev/null
+        if ! echo 255 > "$f" 2>/dev/null; then
+            echo "pwm$p refuses writes - skipping"
+            continue
+        fi
+        sleep 5
+        echo 30 > "$f"
+        sleep 5
+        if ask "Did the fans slow down?"; then
+            echo 255 > "$f"
+            found=$p
+            break
+        fi
+        echo 255 > "$f"
+    done
+
+    if [ -z "$found" ]; then
+        echo "No channel moved the fans. Check they are on a PWM header" >&2
+        echo "and set to Full Speed in the BIOS." >&2
+        exit 1
+    fi
+
+    # A hasty yes on the channel whose reading moves but whose fans do
+    # not would poison the calibration, so test it once more.
+    echo 30 > "$HWMON/pwm$found"
+    sleep 6
+    if ! ask "pwm$found is at 30/255 now. Are the fans clearly slower?"; then
+        echo 255 > "$HWMON/pwm$found"
+        echo "Not confirmed. Run fanctl pwm again, or set it: fanctl pwm <n>" >&2
+        exit 1
+    fi
+    echo 255 > "$HWMON/pwm$found"
+    save_pwm "$found"
 }
 
 usage() {
-    cat <<USAGE
+    cat <<EOF
 fanctl - case fans, controlled by SPEED percentage
 
+  fanctl pwm         Find the channel that drives the fans (run once)
+  fanctl pwm <n>     Set the channel directly
   fanctl calibrate   Measure max RPM (run once)
   fanctl <pct>       Set speed to <pct>% of max RPM
   fanctl status      Show current speed
   fanctl watch [s]   Live view
   fanctl max         100%
-USAGE
+
+  fanctl 60          -> 60% of max RPM
+EOF
 }
 
 case "${1:-}" in
-    calibrate) cmd_calibrate ;;
-    status)    cmd_status ;;
-    watch)     cmd_watch "${2:-2}" ;;
-    max)       cmd_set 100 ;;
-    [0-9]*)    cmd_set "$1" ;;
+    pwm)       cmd_pwm "${2:-}" ;;
+    calibrate) require_pwm; cmd_calibrate ;;
+    status)    require_pwm; cmd_status ;;
+    watch)     require_pwm; cmd_watch "${2:-2}" ;;
+    max)       require_pwm; cmd_set 100 ;;
+    [0-9]*)    require_pwm; cmd_set "$1" ;;
     *)         usage ;;
 esac
 FANCTL_EOF
 
 chmod +x /usr/local/bin/fanctl
 ok "/usr/local/bin/fanctl"
+
+# ------------------------------------------------------------------
+header "PWM channel"
+if [ -n "$PWM_CHANNEL" ]; then
+    /usr/local/bin/fanctl pwm "$PWM_CHANNEL" >/dev/null \
+      || die "no pwm${PWM_CHANNEL} on this chip (FANCTL_PWM)"
+elif [ -s "$PWM_PATH" ]; then
+    :   # set by an earlier run; change it with fanctl pwm
+else
+    # Channel numbers need not match the board labels, and a reading can
+    # move without any fan behind it, so a pick from the list is for
+    # someone who already knows. Everyone else should detect.
+    opts=("detect" "Test each channel while you watch the fans")
+    for f in "$HWMON"/pwm[0-9]; do
+        p=${f##*pwm}
+        opts+=("pwm$p" "reads $(cat "$HWMON/fan${p}_input" 2>/dev/null || echo "?") RPM")
+    done
+    opts+=("later" "Set it later with: fanctl pwm")
+
+    choice=$(gui_radio "PWM channel" "Which channel drives the fans?
+Space marks one, Enter confirms." "${opts[@]}") || choice=later
+    case "$choice" in
+        detect) /usr/local/bin/fanctl pwm || warn "no channel set - run fanctl pwm later" ;;
+        pwm*)   /usr/local/bin/fanctl pwm "${choice#pwm}" >/dev/null \
+                  || warn "no ${choice} on this chip - run fanctl pwm later" ;;
+    esac
+fi
+PWM_CHANNEL=$(cat "$PWM_PATH" 2>/dev/null || true)
+
+if [ -z "$PWM_CHANNEL" ]; then
+    header "Done"
+    cat <<NEXT
+ fanctl is installed, but it does not know which channel drives the
+ fans yet. Next:
+
+   fanctl pwm          find the channel
+   fanctl calibrate    measure max RPM
+
+ Then run this installer again to pick a fixed speed or the TrueNAS curve.
+
+NEXT
+    exit 0
+fi
+ok "channel: pwm${PWM_CHANNEL}"
 
 # ------------------------------------------------------------------
 header "Calibration"
@@ -529,7 +668,7 @@ except ImportError:
 
 CONF_PATH = "/etc/fanctld.conf"
 CAL_PATH = "/etc/fanctl.max"
-PWM_CHANNEL = 2          # physical SYS_FAN1 on this board, see docs/hardware.md
+PWM_PATH = "/etc/fanctl.pwm"
 PWM_MAX = 255
 
 DEFAULT_CURVE = [(0, 35), (36, 45), (40, 55), (43, 70), (46, 85), (50, 100)]
@@ -549,20 +688,32 @@ def find_hwmon():
     for path in glob.glob("/sys/class/hwmon/hwmon*"):
         try:
             with open(os.path.join(path, "name")) as f:
-                if f.read().strip().startswith("it8686"):
+                if f.read().strip().startswith(("it86", "it87")):
                     return path
         except OSError:
             continue
-    sys.exit("it8686 not found. modprobe it87 force_id=0x8686 "
-             "ignore_resource_conflict=1")
+    sys.exit("it87 chip not found. modprobe it87 "
+             "(options in /etc/modprobe.d/it87.conf)")
 
 
 class Fan:
-    def __init__(self, hwmon, channel=PWM_CHANNEL):
-        self.pwm = os.path.join(hwmon, f"pwm{channel}")
-        self.enable = os.path.join(hwmon, f"pwm{channel}_enable")
-        self.tach = os.path.join(hwmon, f"fan{channel}_input")
+    def __init__(self, hwmon):
+        self.channel = self._load_channel(hwmon)
+        self.pwm = os.path.join(hwmon, f"pwm{self.channel}")
+        self.enable = os.path.join(hwmon, f"pwm{self.channel}_enable")
+        self.tach = os.path.join(hwmon, f"fan{self.channel}_input")
         self.max_rpm = self._load_calibration()
+
+    @staticmethod
+    def _load_channel(hwmon):
+        try:
+            with open(PWM_PATH) as f:
+                value = int(f.read().strip())
+            if os.path.exists(os.path.join(hwmon, f"pwm{value}")):
+                return value
+        except (OSError, ValueError):
+            pass
+        sys.exit(f"No PWM channel in {PWM_PATH}. Run: fanctl pwm")
 
     @staticmethod
     def _load_calibration():
@@ -835,7 +986,7 @@ def cmd_status(fan, conf):
     rpm = fan.read_rpm()
     print(f"{'FAN':<10} {'RPM':<7} {'SPEED':<7} {'DUTY'}")
     print("-" * 40)
-    print(f"{'SYS_FAN1':<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
+    print(f"{'pwm' + str(fan.channel):<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
           f"{duty}/255   (max {fan.max_rpm} RPM)")
     print()
     try:
@@ -866,7 +1017,7 @@ def cmd_daemon(fan, conf, interval=None):
 
     interval = interval or conf["POLL"]
     curve, hyst = conf["CURVE"], conf["HYSTERESIS"]
-    log.info("polling every %ds (channel pwm%d)", interval, PWM_CHANNEL)
+    log.info("polling every %ds (channel pwm%d)", interval, fan.channel)
     log.info("curve %s, hysteresis %dC", format_curve(curve), hyst)
     failures = 0
     last_pct = None
@@ -1021,7 +1172,6 @@ def main():
 if __name__ == "__main__":
     main()
 FANCTLD_EOF
-    sed -i "s/^PWM_CHANNEL = .*/PWM_CHANNEL = ${PWM_CHANNEL}/" /usr/local/bin/fanctld
     chmod +x /usr/local/bin/fanctld
 
     printf 'TRUENAS_HOST=%s\nTRUENAS_KEY=%s\n' "$TN_HOST" "$TN_KEY" > "$CONF_PATH"

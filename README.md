@@ -34,9 +34,9 @@ on the tachometer.
 ## Install
 
 For a fresh Proxmox host, `fanctl-install.sh` does everything in one run:
-loads the module (building it if needed), finds the right PWM channel by
-asking you to watch the blades, calibrates, and enables a systemd unit
-for either a fixed speed or the TrueNAS curve.
+loads the module (building it if needed), offers to find the PWM channel
+(or leave it for later with `fanctl pwm`), calibrates, and enables a
+systemd unit for either a fixed speed or the TrueNAS curve.
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/frangeris/fanctl/main/fanctl-install.sh)"
@@ -58,16 +58,17 @@ sudo ./install.sh
 ```
 
 `install.sh` does no detection. It writes `force_id=0x8686` to
-`/etc/modprobe.d/it87.conf`, and the repo copies of `fanctl` and `fanctld`
-look for an `it8686` chip on `pwm2` — the values of the
+`/etc/modprobe.d/it87.conf` — the value of the
 [reference build](#reference-build). On other hardware, use the one-shot
-installer, or adjust those values before running it.
+installer, or adjust it before running.
 
 Then, in order:
 
 1. Set up the firmware (below).
-2. `fanctl calibrate` — runs the fan flat out for 15s and records the peak.
-3. Pick fixed speed or the temperature curve.
+2. `fanctl pwm` — finds the channel that drives the fans (see
+   [Finding the channel](#finding-the-channel)).
+3. `fanctl calibrate` — runs the fan flat out for 15s and records the peak.
+4. Pick fixed speed or the temperature curve.
 
 ## Firmware
 
@@ -86,16 +87,27 @@ Do not trust the channel numbers. With a forced chip ID, `pwm1…pwm5` may
 not match the silkscreen, and a `fanN_input` can return a responsive,
 plausible RPM that has nothing to do with the real fans. The only
 reliable test is to change one channel at a time and watch the blades.
-The installer walks through this; [docs/hardware.md](docs/hardware.md)
-shows the manual loop.
+
+`fanctl pwm` walks through it: each channel runs fast, then slow, and you
+say whether the fans slowed down. The channel you confirm is saved to
+`/etc/fanctl.pwm`, which both `fanctl` and `fanctld` read. If you already
+know the channel, `fanctl pwm <n>` sets it directly.
+
+The installer lists the chip's channels: detect, pick one you already
+know, or leave it for later. You can run `fanctl pwm` again any time.
+
+Changing the channel clears the calibration — a maximum measured on
+another channel's tachometer means nothing — so run `fanctl calibrate`
+afterwards. [docs/hardware.md](docs/hardware.md) shows the manual loop.
 
 ## Manual use
 
 ```bash
-fanctl status        # current speed, RPM, duty
+fanctl status        # current speed, RPM, duty, channel
 fanctl 40            # 40% of max RPM
 fanctl watch         # live view
 fanctl max           # 100%
+fanctl pwm           # find the channel again
 ```
 
 Fixed speed at boot:

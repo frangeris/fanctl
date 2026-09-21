@@ -40,7 +40,7 @@ except ImportError:
 
 CONF_PATH = "/etc/fanctld.conf"
 CAL_PATH = "/etc/fanctl.max"
-PWM_CHANNEL = 2          # physical SYS_FAN1 on this board, see docs/hardware.md
+PWM_PATH = "/etc/fanctl.pwm"
 PWM_MAX = 255
 
 DEFAULT_CURVE = [(0, 35), (36, 45), (40, 55), (43, 70), (46, 85), (50, 100)]
@@ -60,20 +60,32 @@ def find_hwmon():
     for path in glob.glob("/sys/class/hwmon/hwmon*"):
         try:
             with open(os.path.join(path, "name")) as f:
-                if f.read().strip().startswith("it8686"):
+                if f.read().strip().startswith(("it86", "it87")):
                     return path
         except OSError:
             continue
-    sys.exit("it8686 not found. modprobe it87 force_id=0x8686 "
-             "ignore_resource_conflict=1")
+    sys.exit("it87 chip not found. modprobe it87 "
+             "(options in /etc/modprobe.d/it87.conf)")
 
 
 class Fan:
-    def __init__(self, hwmon, channel=PWM_CHANNEL):
-        self.pwm = os.path.join(hwmon, f"pwm{channel}")
-        self.enable = os.path.join(hwmon, f"pwm{channel}_enable")
-        self.tach = os.path.join(hwmon, f"fan{channel}_input")
+    def __init__(self, hwmon):
+        self.channel = self._load_channel(hwmon)
+        self.pwm = os.path.join(hwmon, f"pwm{self.channel}")
+        self.enable = os.path.join(hwmon, f"pwm{self.channel}_enable")
+        self.tach = os.path.join(hwmon, f"fan{self.channel}_input")
         self.max_rpm = self._load_calibration()
+
+    @staticmethod
+    def _load_channel(hwmon):
+        try:
+            with open(PWM_PATH) as f:
+                value = int(f.read().strip())
+            if os.path.exists(os.path.join(hwmon, f"pwm{value}")):
+                return value
+        except (OSError, ValueError):
+            pass
+        sys.exit(f"No PWM channel in {PWM_PATH}. Run: fanctl pwm")
 
     @staticmethod
     def _load_calibration():
@@ -346,7 +358,7 @@ def cmd_status(fan, conf):
     rpm = fan.read_rpm()
     print(f"{'FAN':<10} {'RPM':<7} {'SPEED':<7} {'DUTY'}")
     print("-" * 40)
-    print(f"{'SYS_FAN1':<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
+    print(f"{'pwm' + str(fan.channel):<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
           f"{duty}/255   (max {fan.max_rpm} RPM)")
     print()
     try:
@@ -377,7 +389,7 @@ def cmd_daemon(fan, conf, interval=None):
 
     interval = interval or conf["POLL"]
     curve, hyst = conf["CURVE"], conf["HYSTERESIS"]
-    log.info("polling every %ds (channel pwm%d)", interval, PWM_CHANNEL)
+    log.info("polling every %ds (channel pwm%d)", interval, fan.channel)
     log.info("curve %s, hysteresis %dC", format_curve(curve), hyst)
     failures = 0
     last_pct = None
