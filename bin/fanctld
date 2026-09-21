@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""fanctld - fan curve driven by TrueNAS disk temperatures.
+
+Reads disk temps from TrueNAS over JSON-RPC 2.0 (WebSocket) and writes
+the PWM duty on the Proxmox host. Fails safe to 100% when TrueNAS is
+unreachable.
+
+Config: /etc/fanctld.conf  (mode 600)
+
+    TRUENAS_HOST=192.168.1.121
+    TRUENAS_KEY=<api key>
+    CURVE=0:35,36:45,40:55,43:70,46:85,50:100
+    HYSTERESIS=2
+    POLL=60
+
+CURVE is a comma-separated list of `temp:speed` points, where speed is a
+percentage of the fan's measured maximum RPM. The hottest disk picks the
+point: at or above 46 C in the example above, the fans run at 85%. The
+first point must be 0, so there is always a floor.
+
+HYSTERESIS keeps the fans from oscillating at a boundary: once a step is
+taken, the temperature has to fall that many degrees below the edge
+before stepping back down.
+"""
+
+import glob
+import json
+import os
+import ssl
+import sys
+import time
+import signal
+import argparse
+import logging
+
+try:
+    import websocket
+except ImportError:
+    sys.exit("Missing python3-websocket.  apt install -y python3-websocket")
+
+CONF_PATH = "/etc/fanctld.conf"
+CAL_PATH = "/etc/fanctl.max"
+PWM_CHANNEL = 2          # physical SYS_FAN1 on this board, see docs/hardware.md
+PWM_MAX = 255
+
+DEFAULT_CURVE = [(0, 35), (36, 45), (40, 55), (43, 70), (46, 85), (50, 100)]
+DEFAULT_HYSTERESIS = 2
+DEFAULT_POLL = 60
+
+FAIL_LIMIT = 3           # consecutive failures before forcing 100%
+
+log = logging.getLogger("fanctld")
+
+
+# --------------------------------------------------------------------
+# host side
+# --------------------------------------------------------------------
+
+def find_hwmon():
+    for path in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(path, "name")) as f:
+                if f.read().strip().startswith("it8686"):
+                    return path
+        except OSError:
+            continue
+    sys.exit("it8686 not found. modprobe it87 force_id=0x8686 "
+             "ignore_resource_conflict=1")
+
+
+class Fan:
+    def __init__(self, hwmon, channel=PWM_CHANNEL):
+        self.pwm = os.path.join(hwmon, f"pwm{channel}")
+        self.enable = os.path.join(hwmon, f"pwm{channel}_enable")
+        self.tach = os.path.join(hwmon, f"fan{channel}_input")
+        self.max_rpm = self._load_calibration()
+
+    @staticmethod
+    def _load_calibration():
+        try:
+            with open(CAL_PATH) as f:
+                value = int(f.read().strip())
+            if value > 0:
+                return value
+        except (OSError, ValueError):
+            pass
+        sys.exit(f"No calibration in {CAL_PATH}. Run: fanctl calibrate")
+
+    def set_duty(self, duty):
+        duty = max(0, min(PWM_MAX, int(duty)))
+        try:
+            with open(self.enable, "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+        try:
+            with open(self.pwm, "w") as f:
+                f.write(str(duty))
+        except OSError as exc:
+            log.error("cannot write %s: %s", self.pwm, exc)
+            raise
+        return duty
+
+    def read_duty(self):
+        with open(self.pwm) as f:
+            return int(f.read().strip())
+
+    def read_rpm(self):
+        try:
+            with open(self.tach) as f:
+                return int(f.read().strip())
+        except OSError:
+            return 0
+
+    def set_speed_pct(self, pct, settle=4, tries=8):
+        """Closed loop: aim for pct% of max RPM, return (duty, rpm)."""
+        if pct >= 100:
+            return self.set_duty(PWM_MAX), self.read_rpm()
+
+        target = self.max_rpm * pct // 100
+        duty = PWM_MAX * pct // 100
+        best_duty, best_err = duty, None
+
+        for _ in range(tries):
+            self.set_duty(duty)
+            time.sleep(settle)
+            rpm = self.read_rpm()
+            err = abs(rpm - target)
+            if best_err is None or err < best_err:
+                best_err, best_duty = err, duty
+            if err <= max(target // 33, 25):
+                break
+            step = (target - rpm) * PWM_MAX // self.max_rpm // 2
+            duty = max(1, min(PWM_MAX, duty + step + (1 if step >= 0 else -1)))
+
+        self.set_duty(best_duty)
+        time.sleep(2)
+        return best_duty, self.read_rpm()
+
+
+# --------------------------------------------------------------------
+# TrueNAS side
+# --------------------------------------------------------------------
+
+class TrueNAS:
+    def __init__(self, host, key, timeout=10):
+        self.url = f"wss://{host}/api/current"
+        self.key = key
+        self.timeout = timeout
+        self.ws = None
+        self.msg_id = 0
+
+    def __enter__(self):
+        self.ws = websocket.create_connection(
+            self.url, timeout=self.timeout,
+            sslopt={"cert_reqs": ssl.CERT_NONE},
+        )
+        if not self._call("auth.login_with_api_key", [self.key]):
+            raise RuntimeError("auth.login_with_api_key rejected")
+        return self
+
+    def __exit__(self, *exc):
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+    def _call(self, method, params=None):
+        self.msg_id += 1
+        self.ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": self.msg_id,
+            "method": method,
+            "params": params or [],
+        }))
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            resp = json.loads(self.ws.recv())
+            if resp.get("id") != self.msg_id:
+                continue
+            if "error" in resp:
+                raise RuntimeError(resp["error"].get("message", resp["error"]))
+            return resp.get("result")
+        raise TimeoutError(f"no reply to {method}")
+
+    def disk_temps(self):
+        disks = self._call("disk.query", [[], {"select": ["name"]}])
+        names = [d["name"] for d in disks if d.get("name", "").startswith("sd")]
+        if not names:
+            return {}
+        temps = self._call("disk.temperatures", [names])
+        return {k: v for k, v in temps.items() if isinstance(v, (int, float))}
+
+
+# --------------------------------------------------------------------
+
+def load_conf():
+    if not os.path.exists(CONF_PATH):
+        sys.exit(f"Missing {CONF_PATH}. Run: fanctld init")
+    if os.stat(CONF_PATH).st_mode & 0o077:
+        sys.exit(f"{CONF_PATH} is readable by others. chmod 600 {CONF_PATH}")
+    conf = {}
+    with open(CONF_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip().strip('"').strip("'")
+    for key in ("TRUENAS_HOST", "TRUENAS_KEY"):
+        if not conf.get(key):
+            sys.exit(f"Missing {key} in {CONF_PATH}")
+
+    try:
+        conf["CURVE"] = (parse_curve(conf["CURVE"]) if conf.get("CURVE")
+                         else list(DEFAULT_CURVE))
+    except ValueError as exc:
+        sys.exit(f"Bad CURVE in {CONF_PATH}: {exc}")
+
+    for key, default in (("HYSTERESIS", DEFAULT_HYSTERESIS),
+                         ("POLL", DEFAULT_POLL)):
+        try:
+            conf[key] = int(conf.get(key, default))
+        except ValueError:
+            sys.exit(f"{key} in {CONF_PATH} must be a whole number")
+    if conf["HYSTERESIS"] < 0:
+        sys.exit("HYSTERESIS must not be negative")
+    if conf["POLL"] < 5:
+        sys.exit("POLL must be at least 5 seconds")
+
+    return conf
+
+
+def write_conf_key(key, value):
+    """Replace or append one key in the config, leaving the rest alone."""
+    lines = []
+    replaced = False
+    with open(CONF_PATH) as f:
+        for line in f:
+            if line.strip().startswith(f"{key}="):
+                lines.append(f"{key}={value}\n")
+                replaced = True
+            else:
+                lines.append(line)
+    if not replaced:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(f"{key}={value}\n")
+    with open(CONF_PATH, "w") as f:
+        f.writelines(lines)
+    os.chmod(CONF_PATH, 0o600)
+
+
+def parse_curve(text):
+    """"0:35,40:55,50:100" -> [(0, 35), (40, 55), (50, 100)], validated."""
+    points = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"bad point {chunk!r}, expected temp:speed")
+        temp_s, pct_s = chunk.split(":", 1)
+        try:
+            temp, pct = int(temp_s), int(pct_s)
+        except ValueError:
+            raise ValueError(f"bad point {chunk!r}, expected whole numbers")
+        if not 0 <= pct <= 100:
+            raise ValueError(f"speed {pct} out of range in {chunk!r}")
+        if not 0 <= temp <= 100:
+            raise ValueError(f"temperature {temp} out of range in {chunk!r}")
+        points.append((temp, pct))
+
+    if not points:
+        raise ValueError("curve is empty")
+    points.sort()
+    if points[0][0] != 0:
+        raise ValueError("the first point must be 0, so the curve has a floor")
+    temps = [t for t, _ in points]
+    if len(set(temps)) != len(temps):
+        raise ValueError("duplicate temperature in the curve")
+    speeds = [p for _, p in points]
+    if speeds != sorted(speeds):
+        raise ValueError("speeds must not decrease as temperature rises")
+    return points
+
+
+def format_curve(curve):
+    return ",".join(f"{t}:{p}" for t, p in curve)
+
+
+def curve_table(curve):
+    lines = [f"{'TEMP':<12} {'SPEED':<7} LEVEL", "-" * 46]
+    for i, (temp, pct) in enumerate(curve):
+        upper = curve[i + 1][0] if i + 1 < len(curve) else None
+        band = f"{temp}-{upper - 1}C" if upper else f">= {temp}C"
+        bar = "#" * (pct * 20 // 100) + "." * (20 - pct * 20 // 100)
+        lines.append(f"{band:<12} {str(pct) + '%':<7} [{bar}]")
+    return "\n".join(lines)
+
+
+def lookup(temp, curve):
+    speed = curve[0][1]
+    for threshold, pct in curve:
+        if temp >= threshold:
+            speed = pct
+    return speed
+
+
+def speed_for_temp(temp, curve, current=None, hysteresis=DEFAULT_HYSTERESIS):
+    """Curve lookup, refusing to step down until temp drops far enough.
+
+    Without this a disk sitting on a boundary makes the fans step up and
+    down every poll, which is more irritating than the extra noise.
+    """
+    want = lookup(temp, curve)
+    if current is not None and want < current:
+        if lookup(temp + hysteresis, curve) >= current:
+            return current
+    return want
+
+
+def poll_temps(conf):
+    with TrueNAS(conf["TRUENAS_HOST"], conf["TRUENAS_KEY"]) as nas:
+        temps = nas.disk_temps()
+    if not temps:
+        raise RuntimeError("disk.temperatures returned nothing")
+    return temps
+
+
+def cmd_once(fan, conf, apply_change=True):
+    temps = poll_temps(conf)
+    hottest = max(temps.values())
+    want = speed_for_temp(hottest, conf["CURVE"])
+    if apply_change:
+        duty, rpm = fan.set_speed_pct(want)
+        log.info("hdd max %.0fC -> %d%% | duty %d/255 | %d RPM",
+                 hottest, want, duty, rpm)
+    else:
+        log.info("hdd max %.0fC -> would set %d%%", hottest, want)
+    return hottest, want
+
+
+def cmd_status(fan, conf):
+    duty = fan.read_duty()
+    rpm = fan.read_rpm()
+    print(f"{'FAN':<10} {'RPM':<7} {'SPEED':<7} {'DUTY'}")
+    print("-" * 40)
+    print(f"{'SYS_FAN1':<10} {rpm:<7} {rpm * 100 // fan.max_rpm:<6}% "
+          f"{duty}/255   (max {fan.max_rpm} RPM)")
+    print()
+    try:
+        temps = poll_temps(conf)
+    except Exception as exc:
+        print(f"TrueNAS unreachable: {exc}")
+        return
+    print(f"{'DISK':<8} {'TEMP'}")
+    print("-" * 40)
+    for name, temp in sorted(temps.items(), key=lambda kv: -kv[1]):
+        mark = "  <-- hot" if temp >= 46 else ""
+        print(f"{name:<8} {temp:.0f}C{mark}")
+    hottest = max(temps.values())
+    print(f"\nhottest {hottest:.0f}C -> curve says "
+          f"{speed_for_temp(hottest, conf['CURVE'])}%")
+    print()
+    print(curve_table(conf["CURVE"]))
+
+
+def cmd_daemon(fan, conf, interval=None):
+    def bail(_sig, _frm):
+        log.warning("shutting down - fans to 100%%")
+        fan.set_duty(PWM_MAX)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, bail)
+    signal.signal(signal.SIGTERM, bail)
+
+    interval = interval or conf["POLL"]
+    curve, hyst = conf["CURVE"], conf["HYSTERESIS"]
+    log.info("polling every %ds (channel pwm%d)", interval, PWM_CHANNEL)
+    log.info("curve %s, hysteresis %dC", format_curve(curve), hyst)
+    failures = 0
+    last_pct = None
+
+    while True:
+        started = time.monotonic()
+        try:
+            temps = poll_temps(conf)
+            failures = 0
+            hottest = max(temps.values())
+            want = speed_for_temp(hottest, curve, last_pct, hyst)
+            if want != last_pct:
+                duty, rpm = fan.set_speed_pct(want)
+                log.info("hdd max %.0fC -> %d%% | duty %d/255 | %d RPM",
+                         hottest, want, duty, rpm)
+                last_pct = want
+            else:
+                log.debug("hdd max %.0fC, holding %d%%", hottest, want)
+        except Exception as exc:
+            failures += 1
+            log.error("poll failed (%d/%d): %s", failures, FAIL_LIMIT, exc)
+            if failures >= FAIL_LIMIT:
+                if last_pct != 100:
+                    log.warning("TrueNAS unreachable - forcing 100%%")
+                    fan.set_duty(PWM_MAX)
+                    last_pct = 100
+
+        elapsed = time.monotonic() - started
+        time.sleep(max(1.0, interval - elapsed))
+
+
+def cmd_curve(conf, args):
+    curve = conf["CURVE"]
+
+    if not args:
+        print(curve_table(curve))
+        print(f"\nCURVE={format_curve(curve)}")
+        print(f"HYSTERESIS={conf['HYSTERESIS']}C")
+        return
+
+    action, rest = args[0], args[1:]
+
+    if action == "set":
+        if not rest:
+            sys.exit('usage: fanctld curve set "0:35,40:55,50:100"')
+        try:
+            new = parse_curve(" ".join(rest))
+        except ValueError as exc:
+            sys.exit(f"Bad curve: {exc}")
+        write_conf_key("CURVE", format_curve(new))
+        print(curve_table(new))
+        print(f"\nSaved to {CONF_PATH}.")
+        print("Apply it with:  systemctl restart fanctld")
+        return
+
+    if action == "hysteresis":
+        if not rest:
+            sys.exit("usage: fanctld curve hysteresis <degrees>")
+        try:
+            value = int(rest[0])
+        except ValueError:
+            sys.exit("hysteresis must be a whole number of degrees")
+        if value < 0:
+            sys.exit("hysteresis must not be negative")
+        write_conf_key("HYSTERESIS", value)
+        print(f"HYSTERESIS={value}C saved to {CONF_PATH}.")
+        print("Apply it with:  systemctl restart fanctld")
+        return
+
+    if action == "test":
+        if not rest:
+            sys.exit("usage: fanctld curve test <temperature>")
+        try:
+            temp = float(rest[0])
+        except ValueError:
+            sys.exit("temperature must be a number")
+        plain = speed_for_temp(temp, curve)
+        print(f"{temp:.0f}C -> {plain}%")
+        if conf["HYSTERESIS"]:
+            for current in sorted({p for _, p in curve}, reverse=True):
+                held = speed_for_temp(temp, curve, current, conf["HYSTERESIS"])
+                if held != plain:
+                    print(f"  (holds at {held}% when already running "
+                          f"at {current}%, hysteresis {conf['HYSTERESIS']}C)")
+                    break
+        return
+
+    sys.exit(f"unknown curve action {action!r} - try: set, hysteresis, test")
+
+
+def cmd_init():
+    if os.path.exists(CONF_PATH):
+        sys.exit(f"{CONF_PATH} already exists.")
+    with open(CONF_PATH, "w") as f:
+        f.write(
+            "TRUENAS_HOST=192.168.1.121\n"
+            "TRUENAS_KEY=\n"
+            f"CURVE={format_curve(DEFAULT_CURVE)}\n"
+            f"HYSTERESIS={DEFAULT_HYSTERESIS}\n"
+            f"POLL={DEFAULT_POLL}\n"
+        )
+    os.chmod(CONF_PATH, 0o600)
+    print(f"Created {CONF_PATH} (mode 600). Fill in TRUENAS_KEY.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Fan curve from TrueNAS disk temperatures",
+        epilog='examples:\n'
+               '  fanctld dry-run\n'
+               '  fanctld curve\n'
+               '  fanctld curve set "0:30,38:45,42:60,46:80,50:100"\n'
+               '  fanctld curve hysteresis 3\n'
+               '  fanctld curve test 44\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command",
+                    choices=["status", "once", "dry-run", "daemon", "curve",
+                             "init"])
+    ap.add_argument("args", nargs="*",
+                    help="daemon: poll interval in seconds. "
+                         "curve: set|hysteresis|test plus its argument.")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if args.command == "init":
+        return cmd_init()
+
+    conf = load_conf()
+
+    if args.command == "curve":
+        return cmd_curve(conf, args.args)
+
+    fan = Fan(find_hwmon())
+
+    if args.command == "status":
+        return cmd_status(fan, conf)
+    if args.command == "once":
+        return cmd_once(fan, conf)
+    if args.command == "dry-run":
+        return cmd_once(fan, conf, apply_change=False)
+    if args.command == "daemon":
+        interval = int(args.args[0]) if args.args else None
+        return cmd_daemon(fan, conf, interval)
+
+
+if __name__ == "__main__":
+    main()

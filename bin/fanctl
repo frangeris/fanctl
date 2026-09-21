@@ -1,0 +1,162 @@
+#!/bin/bash
+# fanctl - manual case fan control (SYS_FAN1 / ITE IT8686E)
+#
+# Speed is expressed as a percentage of the fan's measured maximum RPM,
+# not as PWM duty. Run `fanctl calibrate` once to record that maximum.
+
+set -u
+
+HWMON=""
+for h in /sys/class/hwmon/hwmon*; do
+    [ -f "$h/name" ] || continue
+    case "$(cat "$h/name")" in
+        it8686*) HWMON="$h"; break ;;
+    esac
+done
+
+if [ -z "$HWMON" ]; then
+    echo "ERROR: it8686 chip not found." >&2
+    echo "Load it with: modprobe it87 force_id=0x8686 ignore_resource_conflict=1" >&2
+    exit 1
+fi
+
+# Channel 2 drives the physical SYS_FAN1 header on the B450M DS3H V2.
+# The numbering does not match the silkscreen because the driver is
+# forced with an ID that is not this chip's. See docs/hardware.md.
+PWM=2
+CAL=/etc/fanctl.max
+
+read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
+read_duty() { cat "$HWMON/pwm$PWM"; }
+
+write_duty() {
+    echo 1 > "$HWMON/pwm${PWM}_enable" 2>/dev/null
+    if ! echo "$1" > "$HWMON/pwm$PWM" 2>/dev/null; then
+        echo "ERROR: chip refused the write (header in automatic mode)." >&2
+        echo "BIOS -> Smart Fan 5 -> SYS_FAN1 -> Full Speed" >&2
+        exit 1
+    fi
+}
+
+require_cal() {
+    if [ ! -s "$CAL" ]; then
+        echo "No calibration found. Run first:  fanctl calibrate" >&2
+        exit 1
+    fi
+    MAX=$(cat "$CAL")
+    if ! [ "$MAX" -gt 0 ] 2>/dev/null; then
+        echo "Bad calibration in $CAL. Run: fanctl calibrate" >&2
+        exit 1
+    fi
+}
+
+bar() {
+    local pct=$1 filled i out=""
+    [ "$pct" -gt 100 ] && pct=100
+    filled=$(( pct * 20 / 100 ))
+    for ((i=0; i<20; i++)); do
+        if [ "$i" -lt "$filled" ]; then out="${out}#"; else out="${out}."; fi
+    done
+    echo "$out"
+}
+
+cmd_calibrate() {
+    echo "Running fan at 100% for 15s..."
+    write_duty 255
+    sleep 15
+    local peak=0 r i
+    for i in 1 2 3; do
+        r=$(read_rpm)
+        [ "$r" -gt "$peak" ] && peak=$r
+        sleep 2
+    done
+    echo "$peak" > "$CAL"
+    echo "Max speed: $peak RPM  (saved to $CAL)"
+}
+
+cmd_status() {
+    require_cal
+    local rpm duty spct
+    rpm=$(read_rpm)
+    duty=$(read_duty)
+    spct=$(( rpm * 100 / MAX ))
+    printf "%-10s %-6s %-22s %s\n" "SPEED" "RPM" "LEVEL" "DUTY"
+    printf -- "-%.0s" {1..58}; echo
+    printf "%-9s%% %-6s [%s] %s/255\n" "$spct" "$rpm" "$(bar "$spct")" "$duty"
+}
+
+cmd_set() {
+    require_cal
+    local want=$1 target duty rpm i best_d best_err err
+    [ "$want" -lt 0 ] && want=0
+    [ "$want" -gt 100 ] && want=100
+
+    if [ "$want" -eq 0 ]; then
+        write_duty 0
+        echo "SYS_FAN1 -> stopped"
+        return
+    fi
+    if [ "$want" -eq 100 ]; then
+        write_duty 255
+        echo "SYS_FAN1 -> 100% speed (~${MAX} RPM)"
+        return
+    fi
+
+    target=$(( MAX * want / 100 ))
+    duty=$(( 255 * want / 100 ))
+    best_d=$duty; best_err=999999
+
+    for i in $(seq 1 10); do
+        write_duty "$duty"
+        sleep 4
+        rpm=$(read_rpm)
+        err=$(( rpm - target )); [ "$err" -lt 0 ] && err=$(( -err ))
+        if [ "$err" -lt "$best_err" ]; then best_err=$err; best_d=$duty; fi
+        [ "$err" -le $(( target / 33 + 10 )) ] && break
+        if [ "$rpm" -gt "$target" ]; then
+            duty=$(( duty - (rpm - target) * 255 / MAX / 2 - 1 ))
+        else
+            duty=$(( duty + (target - rpm) * 255 / MAX / 2 + 1 ))
+        fi
+        [ "$duty" -lt 1 ] && duty=1
+        [ "$duty" -gt 255 ] && duty=255
+    done
+
+    write_duty "$best_d"
+    sleep 3
+    rpm=$(read_rpm)
+    echo "SYS_FAN1 -> ${want}% speed | target ${target} RPM | actual ${rpm} RPM | duty ${best_d}/255"
+}
+
+cmd_watch() {
+    local interval=${1:-2}
+    trap 'echo; exit 0' INT
+    while true; do
+        clear; date '+%H:%M:%S'; echo
+        cmd_status
+        sleep "$interval"
+    done
+}
+
+usage() {
+    cat <<EOF
+fanctl - case fans (SYS_FAN1), controlled by SPEED percentage
+
+  fanctl calibrate   Measure max RPM (run once)
+  fanctl <pct>       Set speed to <pct>% of max RPM
+  fanctl status      Show current speed
+  fanctl watch [s]   Live view
+  fanctl max         100%
+
+  fanctl 60          -> 60% of max RPM
+EOF
+}
+
+case "${1:-}" in
+    calibrate) cmd_calibrate ;;
+    status)    cmd_status ;;
+    watch)     cmd_watch "${2:-2}" ;;
+    max)       cmd_set 100 ;;
+    [0-9]*)    cmd_set "$1" ;;
+    *)         usage ;;
+esac

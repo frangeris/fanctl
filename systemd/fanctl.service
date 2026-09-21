@@ -1,0 +1,12 @@
+# Fixed fan speed at boot. Use this OR fanctld.service, not both.
+[Unit]
+Description=Case fan speed (fixed)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fanctl 40
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

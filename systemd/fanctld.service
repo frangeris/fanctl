@@ -1,0 +1,15 @@
+# Temperature-driven fan curve. Use this OR fanctl.service, not both.
+[Unit]
+Description=Fan curve from TrueNAS disk temperatures
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fanctld daemon 60
+ExecStopPost=/usr/local/bin/fanctl 100
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
