@@ -200,3 +200,16 @@ passed through. The bring-up notes — the chip without an upstream driver,
 the BIOS handoff, why its channel turned out to be `pwm2` and how the
 tachometer lied on `pwm1` — are in [docs/hardware.md](docs/hardware.md),
 and double as a worked example for bringing up a new board.
+## Uninstall
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/frangeris/fanctl/main/fanctl-install.sh)" -- --uninstall
+```
+
+Running the installer on a host that already has fanctl offers the same
+choice. It removes the binaries, units, config and DKMS module.
+
+**Set the BIOS back to `Normal`** afterwards. The header was left in Full
+Speed so the OS could own it; with nothing driving it, the fans sit at
+100% until the BIOS takes the curve back.
+

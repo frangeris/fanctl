@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # fanctl - one-shot installer for Proxmox VE
 #
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/USER/fanctl/main/fanctl-install.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/frangeris/fanctl/main/fanctl-install.sh)"
 #
 # Case fan control for boards whose ITE Super I/O has no upstream driver.
 # Builds the out-of-tree it87 module, finds which PWM channel actually
 # drives the header, installs fanctl/fanctld and a systemd unit.
 #
+# Run it again on an installed host to reconfigure or remove it:
+#
+#   bash -c "$(curl -fsSL .../fanctl-install.sh)" -- --uninstall
+#
 # Non-interactive overrides:
+#   FANCTL_UNINSTALL=1    remove everything, no prompts
 #   FANCTL_PWM=2          skip channel detection
 #   FANCTL_FORCE_ID=0x8686
 #   FANCTL_SPEED=40       fixed speed, skips the mode prompt
@@ -45,9 +50,17 @@ GUI=0
 [ -t 0 ] && command -v whiptail >/dev/null 2>&1 && GUI=1
 TITLE="fanctl installer"
 
+# Rows a box needs: the text wrapped at the box width, plus the frame
+# and buttons. Keeps a short message from sitting in a mostly empty box.
+box_h() {  # text, extra rows
+    local line n=0
+    while IFS= read -r line; do n=$(( n + ${#line} / 68 + 1 )); done <<< "$1"
+    echo $(( n + $2 ))
+}
+
 gui_msg() {  # title, text
     if [ "$GUI" = 1 ]; then
-        whiptail --title "$TITLE" --backtitle "$1" --msgbox "$2" 20 74
+        whiptail --title "$TITLE" --backtitle "$1" --msgbox "$2" "$(box_h "$2" 6)" 74
     else
         header "$1"; echo "$2"
     fi
@@ -55,7 +68,7 @@ gui_msg() {  # title, text
 
 gui_yesno() {  # title, text -> 0 yes / 1 no
     if [ "$GUI" = 1 ]; then
-        whiptail --title "$TITLE" --backtitle "$1" --yesno "$2" 20 74
+        whiptail --title "$TITLE" --backtitle "$1" --yesno "$2" "$(box_h "$2" 6)" 74
     else
         header "$1"; echo "$2"
         local a; read -rp " [y/N] " a </dev/tty; [[ "${a,,}" == "y" ]]
@@ -93,10 +106,65 @@ gui_menu() {  # title, text, tag1, item1, tag2, item2 ... -> tag on stdout
 }
 
 gui_error() {  # text
-    [ "$GUI" = 1 ] && whiptail --title "$TITLE" --msgbox "ERROR\n\n$1" 14 74 || true
+    [ "$GUI" = 1 ] && whiptail --title "$TITLE" --msgbox "ERROR\n\n$1" "$(box_h "$1" 8)" 74 || true
 }
 
 trap 'die "failed at line $LINENO"' ERR
+
+# ------------------------------------------------------------------
+# uninstall
+# ------------------------------------------------------------------
+do_uninstall() {
+    header "Uninstall"
+
+    [ "${FANCTL_UNINSTALL:-}" = "1" ] || gui_yesno "Uninstall" \
+"Removes fanctl, fanctld, their systemd units, the config and
+calibration, the it87 module settings, and the DKMS module if
+this script built it.
+
+Remove all of it?" || exit 0
+
+    msg "stopping services"
+    systemctl disable -q --now fanctld.service 2>/dev/null || true
+    systemctl disable -q --now fanctl.service 2>/dev/null || true
+    rm -f /etc/systemd/system/fanctl.service /etc/systemd/system/fanctld.service
+    systemctl daemon-reload
+
+    msg "removing files"
+    rm -f /usr/local/bin/fanctl /usr/local/bin/fanctld "$CAL_PATH" "$CONF_PATH"
+    rm -f /etc/modprobe.d/it87.conf
+    sed -i '/^it87$/d' /etc/modules 2>/dev/null || true
+
+    msg "unloading the module"
+    modprobe -r it87 2>/dev/null || warn "it87 busy - gone after a reboot"
+
+    if command -v dkms >/dev/null 2>&1; then
+        ver=$(dkms status it87 2>/dev/null | head -1 | sed 's/[,/]/ /g' | awk '{print $2}')
+        [ -n "${ver:-}" ] && { msg "removing DKMS it87/$ver"
+                               dkms remove "it87/$ver" --all >/dev/null 2>&1 || true; }
+    fi
+    rm -rf "$SRC_DIR"
+    ok "removed"
+
+    gui_msg "Uninstall" \
+"Done. One thing left:
+
+  M.I.T. -> PC Health Status -> Smart Fan 5
+    -> SYS_FAN -> Normal
+
+The header was left in Full Speed for the OS to own. With nothing
+driving it now, the fans sit at 100% until the BIOS takes the
+curve back.
+
+Any TrueNAS API key is gone from this host, but still exists on
+TrueNAS - revoke it there if nothing else uses it."
+
+    warn "set the BIOS back to Normal, or the fans stay at 100%"
+    exit 0
+}
+
+[ "${1:-}" = "--uninstall" ] && do_uninstall
+[ "${FANCTL_UNINSTALL:-}" = "1" ] && do_uninstall
 
 # ------------------------------------------------------------------
 # checks
@@ -117,34 +185,34 @@ cat <<'BANNER'
 
 BANNER
 
+if [ -x /usr/local/bin/fanctl ] || [ -f /etc/systemd/system/fanctld.service ]; then
+    case "$(gui_menu "Already installed" \
+        "fanctl is already on this host." \
+        "1" "Reinstall - run setup from the start" \
+        "2" "Uninstall - remove everything" \
+        "3" "Cancel")" in
+        2) do_uninstall ;;
+        1) : ;;
+        *) exit 0 ;;
+    esac
+fi
+
 gui_yesno "Welcome" \
-"Case fan control for boards whose ITE Super I/O has no upstream driver.
-
-This installer will:
-
-  - build the out-of-tree it87 kernel module (DKMS)
-  - make it load at boot
-  - find which PWM channel really drives the fan header
-  - measure the fans' maximum RPM
-  - install a systemd unit for a fixed speed or a temperature curve
+"Builds the it87 driver, finds the fan's PWM channel, measures
+max RPM and sets a fixed speed or a TrueNAS temperature curve.
 
 Continue?" || exit 0
 
 # ------------------------------------------------------------------
 gui_yesno "BIOS prerequisite" \
-"The Super I/O keeps the fan header in automatic mode until the BIOS \
-hands it over. Until then every PWM write returns EBUSY.
+"In the BIOS, set the fan header to Full Speed:
 
   M.I.T. -> PC Health Status -> Smart Fan 5
-    -> pick the SYS_FAN header
-    -> Fan Speed Control: Full Speed
-  F10 to save
+    -> SYS_FAN -> Full Speed  (F10 to save)
 
-\"Full Speed\" does not mean leaving them loud: it disables the automatic \
-curve so the OS owns the duty register. The fans run at 100% only \
-between POST and the first write.
+The fans stay at 100% only until fanctl starts at boot.
 
-Have you already done this?" \
+Done?" \
   || die "Do the BIOS step first, then run this installer again."
 
 # ------------------------------------------------------------------
@@ -196,13 +264,10 @@ if [ -n "$PWM_CHANNEL" ]; then
     ok "using pwm${PWM_CHANNEL} (FANCTL_PWM)"
 else
     gui_msg "PWM channel" \
-"With a forced device ID the channel numbers do not match the \
-silkscreen, and a tachometer can report a value that merely tracks a \
-PWM register without reflecting any real fan. The only reliable test \
-is watching the blades.
+"Open the case and watch the fans.
 
-Open the case. Each channel will run 5s fast, then 5s slow, and you \
-say whether the fans slowed down."
+Each channel runs 5s fast, then 5s slow.
+Then say whether the fans slowed down."
     for p in 1 2 3 4 5; do
         [ -f "$HWMON/pwm$p" ] || continue
         echo -e "\n ${BL}=== pwm$p ===${CL}"
@@ -220,6 +285,28 @@ Did the case fans SLOW DOWN?"; then
         fi
         echo 255 > "$HWMON/pwm$p"
     done
+    # One channel reports a tachometer that merely tracks its own PWM
+    # register, so the numbers move convincingly while the fans do not.
+    # A hasty yes there poisons everything built on top, so confirm.
+    if [ -n "$PWM_CHANNEL" ]; then
+        echo 1 > "$HWMON/pwm${PWM_CHANNEL}_enable" 2>/dev/null || true
+        echo 30 > "$HWMON/pwm$PWM_CHANNEL"; sleep 6
+        gui_yesno "Confirm pwm${PWM_CHANNEL}" \
+"pwm${PWM_CHANNEL} is at 30/255 right now.
+
+Are the fans clearly SLOWER than a moment ago?
+
+Say no if they are still at full speed: that channel moves the
+reading without moving the fans." || {
+            echo 255 > "$HWMON/pwm$PWM_CHANNEL"
+            die "Channel not confirmed.
+
+Run the installer again and keep going past pwm${PWM_CHANNEL}, or
+set it directly:  FANCTL_PWM=<n>"
+        }
+        echo 255 > "$HWMON/pwm$PWM_CHANNEL"
+    fi
+
     [ -n "$PWM_CHANNEL" ] || die "No channel moved the fans.
 
 Either the fans are wired to constant 12V rather than a PWM header, or \
@@ -393,17 +480,9 @@ UNIT
     systemctl enable -q --now fanctl.service
     ok "fanctl.service enabled at ${SPEED}%"
 else
-    gui_msg "TrueNAS curve" \
-"The disks sit behind an HBA passed through to the TrueNAS VM, so this \
-host cannot read their temperatures directly. The daemon asks TrueNAS \
-over its JSON-RPC API.
-
-Create the key in TrueNAS under the avatar menu -> API Keys, attached \
-to a service account with the Readonly Admin role. Reading temperatures \
-is all it needs, and a full-admin key on the hypervisor only risks the \
-pool."
     TN_HOST=$(gui_input "TrueNAS curve" "TrueNAS address:" "192.168.1.121")
-    TN_KEY=$(gui_password "TrueNAS curve" "TrueNAS API key:")
+    TN_KEY=$(gui_password "TrueNAS curve" \
+        "API key (TrueNAS avatar -> API Keys, Readonly Admin role):")
     [ -n "$TN_HOST" ] && [ -n "$TN_KEY" ] || die "address and API key are both required"
 
     msg "installing fanctld"
