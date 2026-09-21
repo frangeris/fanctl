@@ -103,7 +103,7 @@ afterwards. [docs/hardware.md](docs/hardware.md) shows the manual loop.
 ## Manual use
 
 ```bash
-fanctl status        # current speed, RPM, duty, channel
+fanctl status        # speed, channel, chip, mode and TrueNAS setup
 fanctl 40            # 40% of max RPM
 fanctl watch         # live view
 fanctl max           # 100%

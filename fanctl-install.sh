@@ -301,6 +301,7 @@ fi
 PWM=""
 PWM_PATH=/etc/fanctl.pwm
 CAL=/etc/fanctl.max
+CONF=/etc/fanctld.conf
 
 read_rpm()  { cat "$HWMON/fan${PWM}_input" 2>/dev/null || echo 0; }
 read_duty() { cat "$HWMON/pwm$PWM"; }
@@ -362,15 +363,130 @@ cmd_calibrate() {
     echo "Max speed: $peak RPM  (saved to $CAL)"
 }
 
+row() { printf "  %-11s %s\n" "$1" "$2"; }
+
+# How the chip drives the channel. fanctl needs manual.
+pwm_mode() {
+    case "$(cat "$HWMON/pwm${PWM}_enable" 2>/dev/null)" in
+        0) echo "full speed" ;;
+        1) echo "manual" ;;
+        "") echo "mode unknown" ;;
+        *) echo "automatic (BIOS curve)" ;;
+    esac
+}
+
+chip_info() {
+    local opts
+    opts=$(grep -o 'force_id=[^ ]*' /etc/modprobe.d/it87.conf 2>/dev/null)
+    echo "$(cat "$HWMON/name")${opts:+, $opts}"
+}
+
+# Which unit drives the fans. Both at once fight over the channel.
+fan_mode() {
+    local fixed="" curve="" pct
+    systemctl is-enabled -q fanctl.service 2>/dev/null && fixed=1
+    systemctl is-enabled -q fanctld.service 2>/dev/null && curve=1
+    if [ -n "$fixed" ] && [ -n "$curve" ]; then
+        echo "CONFLICT - fanctl.service and fanctld.service are both enabled"
+    elif [ -n "$curve" ]; then
+        if systemctl is-active -q fanctld.service 2>/dev/null; then
+            echo "TrueNAS curve - fanctld.service running"
+        else
+            echo "TrueNAS curve - fanctld.service NOT running"
+        fi
+    elif [ -n "$fixed" ]; then
+        pct=$(sed -n 's|^ExecStart=.*fanctl \([0-9]*\).*|\1|p' \
+              /etc/systemd/system/fanctl.service 2>/dev/null)
+        echo "fixed ${pct:-?}% at boot - fanctl.service"
+    else
+        echo "manual - no service enabled"
+    fi
+}
+
+# One key from the fanctld config, read the way fanctld reads it.
+conf_get() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | tail -n1 |
+        sed "s/[[:space:]]*\$//; s/^[\"']//; s/[\"']\$//"
+}
+
+# The TrueNAS side, from the config and the daemon's journal. It never
+# calls TrueNAS itself, so watch can run it every couple of seconds.
+show_truenas() {
+    local out="" curve="" hyst="" poll last
+    echo "TRUENAS"
+    if [ ! -e "$CONF" ]; then
+        echo "  not set up"
+        return
+    fi
+    if [ ! -r "$CONF" ]; then
+        echo "  $CONF is readable by root only"
+        return
+    fi
+
+    out=$(conf_get TRUENAS_HOST)
+    row host "${out:-missing}"
+    if [ -n "$(conf_get TRUENAS_KEY)" ]; then
+        row "api key" "✓"
+    else
+        row "api key" "✗ missing"
+    fi
+
+    # fanctld knows the defaults and validates the curve, so ask it.
+    if command -v fanctld >/dev/null; then
+        out=$(fanctld curve 2>&1)
+        curve=$(sed -n 's/^CURVE=//p' <<< "$out")
+        hyst=$(sed -n 's/^HYSTERESIS=//p' <<< "$out")
+    else
+        out="fanctld is not installed"
+    fi
+    if [ -n "$curve" ]; then
+        row curve "$(sed 's/\([0-9]*\):\([0-9]*\)/\1C \2%/g; s/,/, /g' <<< "$curve")"
+        row hysteresis "$hyst"
+    else
+        row error "$(tail -n1 <<< "$out")"
+    fi
+
+    # The unit's interval overrides POLL in the config.
+    poll=$(sed -n 's|^ExecStart=.*fanctld daemon \([0-9][0-9]*\).*|\1|p' \
+           /etc/systemd/system/fanctld.service 2>/dev/null)
+    [ -n "$poll" ] || poll=$(conf_get POLL)
+    row poll "every ${poll:-60}s"
+
+    # fanctld only logs when the speed changes, so the date matters: take
+    # journald's, not the time inside the message.
+    last=$(journalctl -u fanctld.service -n 20 -o short -q --no-pager 2>/dev/null |
+           grep -E ' (INFO|WARNING|ERROR) ' | tail -n1 |
+           sed 's/^\([A-Z][a-z]* *[0-9]* [0-9:]*\) [^ ]* [^:]*: [0-9:]* /\1 /')
+    [ -n "$last" ] && row "last log" "${last/ INFO / }"
+    row "disk temps" "run: fanctld status"
+}
+
+# Everything that is set up, and what is still missing.
 cmd_status() {
-    require_cal
-    local rpm duty spct
-    rpm=$(read_rpm)
-    duty=$(read_duty)
-    spct=$(( rpm * 100 / MAX ))
-    printf "%-10s %-6s %-22s %-8s %s\n" "SPEED" "RPM" "LEVEL" "DUTY" "CHANNEL"
-    printf -- "-%.0s" {1..66}; echo
-    printf "%-9s%% %-6s [%s] %-8s pwm%s\n" "$spct" "$rpm" "$(bar "$spct")" "$duty/255" "$PWM"
+    local p max rpm spct
+    p=$(cat "$PWM_PATH" 2>/dev/null)
+    max=$(cat "$CAL" 2>/dev/null)
+
+    echo "FAN"
+    if [ -n "$p" ] && [ -f "$HWMON/pwm$p" ]; then
+        PWM=$p
+        rpm=$(read_rpm)
+        if [ "${max:-0}" -gt 0 ] 2>/dev/null; then
+            spct=$(( rpm * 100 / max ))
+            row speed "${spct}%  [$(bar "$spct")]"
+            row rpm "$rpm of $max max"
+        else
+            row rpm "$rpm, max not measured - run: fanctl calibrate"
+        fi
+        row duty "$(read_duty)/255"
+        row channel "pwm$PWM, $(pwm_mode)"
+    else
+        row channel "not set - run: fanctl pwm"
+    fi
+    row chip "$(chip_info)"
+    row mode "$(fan_mode)"
+    echo
+    show_truenas
 }
 
 cmd_set() {
@@ -514,7 +630,7 @@ fanctl - case fans, controlled by SPEED percentage
   fanctl pwm <n>     Set the channel directly
   fanctl calibrate   Measure max RPM (run once)
   fanctl <pct>       Set speed to <pct>% of max RPM
-  fanctl status      Show current speed
+  fanctl status      Show speed, channel, mode and TrueNAS setup
   fanctl watch [s]   Live view
   fanctl max         100%
 
@@ -525,8 +641,8 @@ EOF
 case "${1:-}" in
     pwm)       cmd_pwm "${2:-}" ;;
     calibrate) require_pwm; cmd_calibrate ;;
-    status)    require_pwm; cmd_status ;;
-    watch)     require_pwm; cmd_watch "${2:-2}" ;;
+    status)    cmd_status ;;
+    watch)     cmd_watch "${2:-2}" ;;
     max)       require_pwm; cmd_set 100 ;;
     [0-9]*)    require_pwm; cmd_set "$1" ;;
     *)         usage ;;
@@ -1208,10 +1324,6 @@ fi
 header "Done"
 /usr/local/bin/fanctl status
 cat <<SUMMARY
-
- channel    pwm${PWM_CHANNEL}
- max speed  ${MAX_RPM} RPM
- mode       ${MODE}
 
  fanctl 50          set 50% of max RPM
  fanctl watch       live view
